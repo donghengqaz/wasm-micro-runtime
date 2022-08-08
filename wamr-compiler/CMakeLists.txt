@@ -35,6 +35,15 @@ add_definitions(-DWASM_ENABLE_REF_TYPES=1)
 add_definitions(-DWASM_ENABLE_CUSTOM_NAME_SECTION=1)
 add_definitions(-DWASM_ENABLE_DUMP_CALL_STACK=1)
 add_definitions(-DWASM_ENABLE_PERF_PROFILING=1)
+add_definitions(-DWASM_ENABLE_LOAD_CUSTOM_SECTION=1)
+
+if (WAMR_BUILD_LLVM_LEGACY_PM EQUAL 1)
+  add_definitions(-DWASM_ENABLE_LLVM_LEGACY_PM=1)
+endif()
+
+if (DEFINED WAMR_BUILD_AOT_FUNC_PREFIX)
+  add_definitions(-DAOT_FUNC_PREFIX="${WAMR_BUILD_AOT_FUNC_PREFIX}")
+endif ()
 
 # Set WAMR_BUILD_TARGET, currently values supported:
 # "X86_64", "AMD_64", "X86_32", "ARM_32", "MIPS_32", "XTENSA_32"
@@ -177,6 +186,14 @@ include (${SHARED_DIR}/utils/shared_utils.cmake)
 include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 include (${IWASM_DIR}/libraries/thread-mgr/thread_mgr.cmake)
 include (${IWASM_DIR}/libraries/libc-builtin/libc_builtin.cmake)
+if (NOT MINGW)
+  if (NOT MSVC)
+    include (${IWASM_DIR}/libraries/libc-wasi/libc_wasi.cmake)
+  else()
+    include (${IWASM_DIR}/libraries/libc-uvwasi/libc_uvwasi.cmake)
+  endif()
+endif()
+include (${IWASM_DIR}/libraries/lib-pthread/lib_pthread.cmake)
 include (${IWASM_DIR}/common/iwasm_common.cmake)
 include (${IWASM_DIR}/interpreter/iwasm_interp.cmake)
 include (${IWASM_DIR}/aot/iwasm_aot.cmake)
@@ -191,7 +208,7 @@ if (WAMR_BUILD_TARGET MATCHES "X86_.*" OR WAMR_BUILD_TARGET STREQUAL "AMD_64")
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined \
                                           -fno-sanitize=bounds,bounds-strict,alignment \
                                           -fno-sanitize-recover")
-      set(lib_ubsan ubsan)
+      set(lib_ubsan -fsanitize=undefined)
     endif()
   else ()
     # UNDEFINED BEHAVIOR, refer to https://en.cppreference.com/w/cpp/language/ub
@@ -199,7 +216,7 @@ if (WAMR_BUILD_TARGET MATCHES "X86_.*" OR WAMR_BUILD_TARGET STREQUAL "AMD_64")
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined \
                                           -fno-sanitize=bounds,alignment \
                                           -fno-sanitize-recover")
-      set(lib_ubsan ubsan)
+      set(lib_ubsan -fsanitize=undefined)
     endif()
   endif()
 endif ()
@@ -209,6 +226,7 @@ if (NOT MSVC)
 endif()
 if (NOT (MSVC OR CMAKE_C_COMPILER MATCHES ".*clang.*" OR CMAKE_C_COMPILER_ID MATCHES ".*Clang"))
   set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-z,noexecstack,-z,relro,-z,now")
+  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-z,noexecstack,-z,relro,-z,now")
 endif()
 
 # We disable these flags by default to stay the same with wasm runtime
@@ -222,6 +240,10 @@ if (NOT MSVC)
   endif()
 endif()
 
+if (MSVC)
+  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_WINSOCK_DEPRECATED_NO_WARNINGS")
+endif()
+
 # message ("-- CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
 
 add_library (vmlib
@@ -231,6 +253,8 @@ add_library (vmlib
              ${UNCOMMON_SHARED_SOURCE}
              ${THREAD_MGR_SOURCE}
              ${LIBC_BUILTIN_SOURCE}
+             ${LIBC_WASI_SOURCE}
+             ${LIB_PTHREAD_SOURCE}
              ${IWASM_COMMON_SOURCE}
              ${IWASM_INTERP_SOURCE}
              ${IWASM_AOT_SOURCE})
@@ -241,7 +265,13 @@ add_executable (wamrc main.c)
 
 if (NOT MSVC)
   target_link_libraries (wamrc aotclib vmlib LLVMDemangle ${LLVM_AVAILABLE_LIBS} ${lib_ubsan}
-                         -lm -ldl -lpthread ${lib_lldb})
+                         -lm -lpthread ${lib_lldb} ${UV_A_LIBS})
+  if (MINGW)
+      target_link_libraries (wamrc -lssp -lWs2_32)
+  else()
+      target_link_libraries (wamrc -ldl)
+  endif()
 else()
-  target_link_libraries (wamrc aotclib vmlib  ${lib_lldb} ${LLVM_AVAILABLE_LIBS} ${lib_ubsan})
+  target_link_libraries (wamrc aotclib vmlib  ${lib_lldb} ${LLVM_AVAILABLE_LIBS} ${lib_ubsan}
+                         ${UV_A_LIBS})
 endif()

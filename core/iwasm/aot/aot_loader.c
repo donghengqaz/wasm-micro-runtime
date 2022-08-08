@@ -14,11 +14,13 @@
 #include "../compilation/aot_llvm.h"
 #include "../interpreter/wasm_loader.h"
 #endif
+
 #if WASM_ENABLE_DEBUG_AOT != 0
 #include "debug/elf_parser.h"
 #include "debug/jit_debug.h"
 #endif
 
+#define YMM_PLT_PREFIX "__ymm@"
 #define XMM_PLT_PREFIX "__xmm@"
 #define REAL_PLT_PREFIX "__real@"
 
@@ -90,7 +92,8 @@ static bool
 check_buf(const uint8 *buf, const uint8 *buf_end, uint32 length,
           char *error_buf, uint32 error_buf_size)
 {
-    if (buf + length < buf || buf + length > buf_end) {
+    if ((uintptr_t)buf + length < (uintptr_t)buf
+        || (uintptr_t)buf + length > (uintptr_t)buf_end) {
         set_error_buf(error_buf, error_buf_size, "unexpect end");
         return false;
     }
@@ -149,7 +152,7 @@ GET_U64_FROM_ADDR(uint32 *addr)
 #define read_byte_array(p, p_end, addr, len) \
     do {                                     \
         CHECK_BUF(p, p_end, len);            \
-        memcpy(addr, p, len);                \
+        bh_memcpy_s(addr, len, p, len);      \
         p += len;                            \
     } while (0)
 
@@ -259,48 +262,34 @@ load_string(uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
     char *str;
     uint16 str_len;
 
-    CHECK_BUF(p, p_end, 1);
-    if (*p & 0x80) {
-        /* The string has been adjusted */
-        str = (char *)++p;
-        /* Ensure the whole string is in range */
-        do {
-            CHECK_BUF(p, p_end, 1);
-        } while (*p++ != '\0');
+    read_uint16(p, p_end, str_len);
+    CHECK_BUF(p, p_end, str_len);
+
+    if (str_len == 0) {
+        str = "";
+    }
+    else if (p[str_len - 1] == '\0') {
+        /* The string is terminated with '\0', use it directly */
+        str = (char *)p;
+    }
+    else if (is_load_from_file_buf) {
+        /* As the file buffer can be referred to after loading,
+           we use the 2 bytes of size to adjust the string:
+           move string 2 byte backward and then append '\0' */
+        str = (char *)(p - 2);
+        bh_memmove_s(str, (uint32)(str_len + 1), p, (uint32)str_len);
+        str[str_len] = '\0';
     }
     else {
-        /* The string hasn't been adjusted */
-        read_uint16(p, p_end, str_len);
-        CHECK_BUF(p, p_end, str_len);
-
-        if (str_len == 0) {
-            str = "";
+        /* Load from sections, the file buffer cannot be reffered to
+           after loading, we must create another string and insert it
+           into const string set */
+        if (!(str = const_str_set_insert((uint8 *)p, str_len, module, error_buf,
+                                         error_buf_size))) {
+            goto fail;
         }
-        else if (p[str_len - 1] == '\0') {
-            /* The string is terminated with '\0', use it directly */
-            str = (char *)p;
-        }
-        else if (is_load_from_file_buf) {
-            /* As the file buffer can be referred to after loading,
-               we use the 2 bytes of size to adjust the string:
-               mark the flag with the highest bit of size[0],
-               move string 1 byte backward and then append '\0' */
-            *(p - 2) |= 0x80;
-            bh_memmove_s(p - 1, (uint32)(str_len + 1), p, (uint32)str_len);
-            p[str_len - 1] = '\0';
-            str = (char *)(p - 1);
-        }
-        else {
-            /* Load from sections, the file buffer cannot be reffered to
-               after loading, we must create another string and insert it
-               into const string set */
-            if (!(str = const_str_set_insert((uint8 *)p, str_len, module,
-                                             error_buf, error_buf_size))) {
-                goto fail;
-            }
-        }
-        p += str_len;
     }
+    p += str_len;
 
     *p_buf = p;
     return str;
@@ -466,6 +455,12 @@ get_native_symbol_by_name(const char *name)
 }
 
 static bool
+str2uint32(const char *buf, uint32 *p_res);
+
+static bool
+str2uint64(const char *buf, uint64 *p_res);
+
+static bool
 load_native_symbol_section(const uint8 *buf, const uint8 *buf_end,
                            AOTModule *module, bool is_load_from_file_buf,
                            char *error_buf, uint32 error_buf_size)
@@ -487,11 +482,40 @@ load_native_symbol_section(const uint8 *buf, const uint8 *buf_end,
 
         for (i = cnt - 1; i >= 0; i--) {
             read_string(p, p_end, symbol);
-            module->native_symbol_list[i] = get_native_symbol_by_name(symbol);
-            if (module->native_symbol_list[i] == NULL) {
-                set_error_buf_v(error_buf, error_buf_size,
-                                "missing native symbol: %s", symbol);
-                goto fail;
+            if (!strncmp(symbol, "f32#", 4) || !strncmp(symbol, "i32#", 4)) {
+                uint32 u32;
+                /* Resolve the raw int bits of f32 const */
+                if (!str2uint32(symbol + 4, &u32)) {
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "resolve symbol %s failed", symbol);
+                    goto fail;
+                }
+                *(uint32 *)(&module->native_symbol_list[i]) = u32;
+            }
+            else if (!strncmp(symbol, "f64#", 4)
+                     || !strncmp(symbol, "i64#", 4)) {
+                uint64 u64;
+                /* Resolve the raw int bits of f64 const */
+                if (!str2uint64(symbol + 4, &u64)) {
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "resolve symbol %s failed", symbol);
+                    goto fail;
+                }
+                *(uint64 *)(&module->native_symbol_list[i]) = u64;
+            }
+            else if (!strncmp(symbol, "__ignore", 8)) {
+                /* Padding bytes to make f64 on 8-byte aligned address,
+                   or it is the second 32-bit slot in 32-bit system */
+                continue;
+            }
+            else {
+                module->native_symbol_list[i] =
+                    get_native_symbol_by_name(symbol);
+                if (module->native_symbol_list[i] == NULL) {
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "missing native symbol: %s", symbol);
+                    goto fail;
+                }
             }
         }
     }
@@ -652,6 +676,36 @@ load_custom_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
                                    error_buf, error_buf_size))
                 goto fail;
             break;
+#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+        case AOT_CUSTOM_SECTION_RAW:
+        {
+            const char *section_name;
+            WASMCustomSection *section;
+
+            if (p >= p_end) {
+                set_error_buf(error_buf, error_buf_size, "unexpected end");
+                goto fail;
+            }
+
+            read_string(p, p_end, section_name);
+
+            section = loader_malloc(sizeof(WASMCustomSection), error_buf,
+                                    error_buf_size);
+            if (!section) {
+                goto fail;
+            }
+
+            section->name_addr = (char *)section_name;
+            section->name_len = strlen(section_name);
+            section->content_addr = (uint8 *)p;
+            section->content_len = p_end - p;
+
+            section->next = module->custom_section_list;
+            module->custom_section_list = section;
+            LOG_VERBOSE("Load custom section [%s] success.", section_name);
+            break;
+        }
+#endif /* end of WASM_ENABLE_LOAD_CUSTOM_SECTION != 0 */
         default:
             break;
     }
@@ -819,6 +873,7 @@ load_import_table_list(const uint8 **p_buf, const uint8 *buf_end,
 
     /* keep sync with aot_emit_table_info() aot_emit_aot_file */
     for (i = 0; i < module->import_table_count; i++, import_table++) {
+        read_uint32(buf, buf_end, import_table->elem_type);
         read_uint32(buf, buf_end, import_table->table_init_size);
         read_uint32(buf, buf_end, import_table->table_max_size);
         read_uint32(buf, buf_end, possible_grow);
@@ -1250,7 +1305,7 @@ load_import_funcs(const uint8 **p_buf, const uint8 *buf_end, AOTModule *module,
 #if WASM_ENABLE_LIBC_WASI != 0
         if (!strcmp(import_funcs[i].module_name, "wasi_unstable")
             || !strcmp(import_funcs[i].module_name, "wasi_snapshot_preview1"))
-            module->is_wasi_module = true;
+            module->import_wasi_api = true;
 #endif
     }
 
@@ -1541,8 +1596,10 @@ load_function_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
 
 #if defined(OS_ENABLE_HW_BOUND_CHECK) && defined(BH_PLATFORM_WINDOWS)
     if (module->func_count > 0) {
+        uint32 plt_table_size =
+            module->is_indirect_mode ? 0 : get_plt_table_size();
         rtl_func_table[module->func_count - 1].EndAddress =
-            (DWORD)(module->code_size - get_plt_table_size());
+            (DWORD)(module->code_size - plt_table_size);
 
         if (!RtlAddFunctionTable(rtl_func_table, module->func_count,
                                  (DWORD64)(uintptr_t)module->code)) {
@@ -1689,11 +1746,19 @@ resolve_target_sym(const char *symbol, int32 *p_index)
     if (!(target_sym_map = get_target_symbol_map(&num)))
         return NULL;
 
-    for (i = 0; i < num; i++)
-        if (!strcmp(target_sym_map[i].symbol_name, symbol)) {
+    for (i = 0; i < num; i++) {
+        if (!strcmp(target_sym_map[i].symbol_name, symbol)
+#if defined(_WIN32) || defined(_WIN32_)
+            /* In Win32, the symbol name of function added by
+               LLVMAddFunction() is prefixed by '_', ignore it */
+            || (strlen(symbol) > 1 && symbol[0] == '_'
+                && !strcmp(target_sym_map[i].symbol_name, symbol + 1))
+#endif
+        ) {
             *p_index = (int32)i;
             return target_sym_map[i].symbol_addr;
         }
+    }
     return NULL;
 }
 
@@ -1703,7 +1768,6 @@ is_literal_relocation(const char *reloc_sec_name)
     return !strcmp(reloc_sec_name, ".rela.literal");
 }
 
-#if defined(BH_PLATFORM_WINDOWS)
 static bool
 str2uint32(const char *buf, uint32 *p_res)
 {
@@ -1749,7 +1813,6 @@ str2uint64(const char *buf, uint64 *p_res)
     *p_res = res;
     return true;
 }
-#endif
 
 static bool
 do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
@@ -1761,7 +1824,8 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
         is_literal ? module->literal_size : module->code_size;
     uint32 i, func_index, symbol_len;
 #if defined(BH_PLATFORM_WINDOWS)
-    uint32 xmm_plt_index = 0, real_plt_index = 0, float_plt_index = 0;
+    uint32 ymm_plt_index = 0, xmm_plt_index = 0;
+    uint32 real_plt_index = 0, float_plt_index = 0, j;
 #endif
     char symbol_buf[128] = { 0 }, *symbol, *p;
     void *symbol_addr;
@@ -1784,7 +1848,7 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                 return false;
             }
         }
-        memcpy(symbol, relocation->symbol_name, symbol_len);
+        bh_memcpy_s(symbol, symbol_len, relocation->symbol_name, symbol_len);
         symbol[symbol_len] = '\0';
 
         if (!strncmp(symbol, AOT_FUNC_PREFIX, strlen(AOT_FUNC_PREFIX))) {
@@ -1804,7 +1868,9 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                  || !strcmp(symbol, ".rdata")
                  || !strcmp(symbol, ".rodata")
                  /* ".rodata.cst4/8/16/.." */
-                 || !strncmp(symbol, ".rodata.cst", strlen(".rodata.cst"))) {
+                 || !strncmp(symbol, ".rodata.cst", strlen(".rodata.cst"))
+                 /* ".rodata.strn.m" */
+                 || !strncmp(symbol, ".rodata.str", strlen(".rodata.str"))) {
             symbol_addr = get_data_section_addr(module, symbol, NULL);
             if (!symbol_addr) {
                 set_error_buf_v(error_buf, error_buf_size,
@@ -1816,31 +1882,45 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
             symbol_addr = module->literal;
         }
 #if defined(BH_PLATFORM_WINDOWS)
-        /* Relocation for symbols which start with "__xmm@" or "__real@" and
-           end with the xmm value or real value. In Windows PE file, the data
-           is stored in some individual ".rdata" sections. We simply create
-           extra plt data, parse the values from the symbols and stored them
-           into the extra plt data. */
+        /* Relocation for symbols which start with "__ymm@", "__xmm@" or
+           "__real@" and end with the ymm value, xmm value or real value.
+           In Windows PE file, the data is stored in some individual ".rdata"
+           sections. We simply create extra plt data, parse the values from
+           the symbols and stored them into the extra plt data. */
+        else if (!strcmp(group->section_name, ".text")
+                 && !strncmp(symbol, YMM_PLT_PREFIX, strlen(YMM_PLT_PREFIX))
+                 && strlen(symbol) == strlen(YMM_PLT_PREFIX) + 64) {
+            char ymm_buf[17] = { 0 };
+
+            symbol_addr = module->extra_plt_data + ymm_plt_index * 32;
+            for (j = 0; j < 4; j++) {
+                bh_memcpy_s(ymm_buf, sizeof(ymm_buf),
+                            symbol + strlen(YMM_PLT_PREFIX) + 48 - 16 * j, 16);
+                if (!str2uint64(ymm_buf,
+                                (uint64 *)((uint8 *)symbol_addr + 8 * j))) {
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "resolve symbol %s failed", symbol);
+                    goto check_symbol_fail;
+                }
+            }
+            ymm_plt_index++;
+        }
         else if (!strcmp(group->section_name, ".text")
                  && !strncmp(symbol, XMM_PLT_PREFIX, strlen(XMM_PLT_PREFIX))
                  && strlen(symbol) == strlen(XMM_PLT_PREFIX) + 32) {
             char xmm_buf[17] = { 0 };
 
-            symbol_addr = module->extra_plt_data + xmm_plt_index * 16;
-            bh_memcpy_s(xmm_buf, sizeof(xmm_buf),
-                        symbol + strlen(XMM_PLT_PREFIX) + 16, 16);
-            if (!str2uint64(xmm_buf, (uint64 *)symbol_addr)) {
-                set_error_buf_v(error_buf, error_buf_size,
-                                "resolve symbol %s failed", symbol);
-                goto check_symbol_fail;
-            }
-
-            bh_memcpy_s(xmm_buf, sizeof(xmm_buf),
-                        symbol + strlen(XMM_PLT_PREFIX), 16);
-            if (!str2uint64(xmm_buf, (uint64 *)((uint8 *)symbol_addr + 8))) {
-                set_error_buf_v(error_buf, error_buf_size,
-                                "resolve symbol %s failed", symbol);
-                goto check_symbol_fail;
+            symbol_addr = module->extra_plt_data + module->ymm_plt_count * 32
+                          + xmm_plt_index * 16;
+            for (j = 0; j < 2; j++) {
+                bh_memcpy_s(xmm_buf, sizeof(xmm_buf),
+                            symbol + strlen(XMM_PLT_PREFIX) + 16 - 16 * j, 16);
+                if (!str2uint64(xmm_buf,
+                                (uint64 *)((uint8 *)symbol_addr + 8 * j))) {
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "resolve symbol %s failed", symbol);
+                    goto check_symbol_fail;
+                }
             }
             xmm_plt_index++;
         }
@@ -1849,8 +1929,8 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                  && strlen(symbol) == strlen(REAL_PLT_PREFIX) + 16) {
             char real_buf[17] = { 0 };
 
-            symbol_addr = module->extra_plt_data + module->xmm_plt_count * 16
-                          + real_plt_index * 8;
+            symbol_addr = module->extra_plt_data + module->ymm_plt_count * 32
+                          + module->xmm_plt_count * 16 + real_plt_index * 8;
             bh_memcpy_s(real_buf, sizeof(real_buf),
                         symbol + strlen(REAL_PLT_PREFIX), 16);
             if (!str2uint64(real_buf, (uint64 *)symbol_addr)) {
@@ -1865,7 +1945,8 @@ do_text_relocation(AOTModule *module, AOTRelocationGroup *group,
                  && strlen(symbol) == strlen(REAL_PLT_PREFIX) + 8) {
             char float_buf[9] = { 0 };
 
-            symbol_addr = module->extra_plt_data + module->xmm_plt_count * 16
+            symbol_addr = module->extra_plt_data + module->ymm_plt_count * 32
+                          + module->xmm_plt_count * 16
                           + module->real_plt_count * 8 + float_plt_index * 4;
             bh_memcpy_s(float_buf, sizeof(float_buf),
                         symbol + strlen(REAL_PLT_PREFIX), 8);
@@ -1993,6 +2074,7 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
     uint8 *symbol_buf, *symbol_buf_end;
     int map_prot, map_flags;
     bool ret = false;
+    char **symbols = NULL;
 
     read_uint32(buf, buf_end, symbol_count);
 
@@ -2011,6 +2093,14 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
         set_error_buf(error_buf, error_buf_size,
                       "validate symbol table failed");
         goto fail;
+    }
+
+    if (symbol_count > 0) {
+        symbols = loader_malloc((uint64)sizeof(*symbols) * symbol_count,
+                                error_buf, error_buf_size);
+        if (symbols == NULL) {
+            goto fail;
+        }
     }
 
 #if defined(BH_PLATFORM_WINDOWS)
@@ -2073,19 +2163,37 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
             memcpy(group_name_buf, group_name, group_name_len);
             memcpy(symbol_name_buf, symbol_name, symbol_name_len);
 
-            if (group_name_len == strlen(".text")
+            if ((group_name_len == strlen(".text")
+                 || (module->is_indirect_mode
+                     && group_name_len == strlen(".text") + 1))
                 && !strncmp(group_name, ".text", strlen(".text"))) {
-                if (symbol_name_len == strlen(XMM_PLT_PREFIX) + 32
-                    && !strncmp(symbol_name, XMM_PLT_PREFIX,
-                                strlen(XMM_PLT_PREFIX))) {
+                if ((symbol_name_len == strlen(YMM_PLT_PREFIX) + 64
+                     || (module->is_indirect_mode
+                         && symbol_name_len == strlen(YMM_PLT_PREFIX) + 64 + 1))
+                    && !strncmp(symbol_name, YMM_PLT_PREFIX,
+                                strlen(YMM_PLT_PREFIX))) {
+                    module->ymm_plt_count++;
+                }
+                else if ((symbol_name_len == strlen(XMM_PLT_PREFIX) + 32
+                          || (module->is_indirect_mode
+                              && symbol_name_len
+                                     == strlen(XMM_PLT_PREFIX) + 32 + 1))
+                         && !strncmp(symbol_name, XMM_PLT_PREFIX,
+                                     strlen(XMM_PLT_PREFIX))) {
                     module->xmm_plt_count++;
                 }
-                else if (symbol_name_len == strlen(REAL_PLT_PREFIX) + 16
+                else if ((symbol_name_len == strlen(REAL_PLT_PREFIX) + 16
+                          || (module->is_indirect_mode
+                              && symbol_name_len
+                                     == strlen(REAL_PLT_PREFIX) + 16 + 1))
                          && !strncmp(symbol_name, REAL_PLT_PREFIX,
                                      strlen(REAL_PLT_PREFIX))) {
                     module->real_plt_count++;
                 }
-                else if (symbol_name_len == strlen(REAL_PLT_PREFIX) + 8
+                else if ((symbol_name_len >= strlen(REAL_PLT_PREFIX) + 8
+                          || (module->is_indirect_mode
+                              && symbol_name_len
+                                     == strlen(REAL_PLT_PREFIX) + 8 + 1))
                          && !strncmp(symbol_name, REAL_PLT_PREFIX,
                                      strlen(REAL_PLT_PREFIX))) {
                     module->float_plt_count++;
@@ -2095,7 +2203,8 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
     }
 
     /* Allocate memory for extra plt data */
-    size = sizeof(uint64) * 2 * module->xmm_plt_count
+    size = sizeof(uint64) * 4 * module->ymm_plt_count
+           + sizeof(uint64) * 2 * module->xmm_plt_count
            + sizeof(uint64) * module->real_plt_count
            + sizeof(uint32) * module->float_plt_count;
     if (size > 0) {
@@ -2128,7 +2237,6 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
     for (i = 0, group = groups; i < group_count; i++, group++) {
         AOTRelocation *relocation;
         uint32 name_index;
-        uint8 *name_addr;
 
         /* section name address is 4 bytes aligned. */
         buf = (uint8 *)align_ptr(buf, sizeof(uint32));
@@ -2140,8 +2248,12 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
             goto fail;
         }
 
-        name_addr = symbol_buf + symbol_offsets[name_index];
-        read_string(name_addr, buf_end, group->section_name);
+        if (symbols[name_index] == NULL) {
+            uint8 *name_addr = symbol_buf + symbol_offsets[name_index];
+
+            read_string(name_addr, buf_end, symbols[name_index]);
+        }
+        group->section_name = symbols[name_index];
 
         read_uint32(buf, buf_end, group->relocation_count);
 
@@ -2156,7 +2268,6 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
         /* Load each relocation */
         for (j = 0; j < group->relocation_count; j++, relocation++) {
             uint32 symbol_index;
-            uint8 *symbol_addr;
 
             if (sizeof(void *) == 8) {
                 read_uint64(buf, buf_end, relocation->relocation_offset);
@@ -2178,8 +2289,12 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
                 goto fail;
             }
 
-            symbol_addr = symbol_buf + symbol_offsets[symbol_index];
-            read_string(symbol_addr, buf_end, relocation->symbol_name);
+            if (symbols[symbol_index] == NULL) {
+                uint8 *symbol_addr = symbol_buf + symbol_offsets[symbol_index];
+
+                read_string(symbol_addr, buf_end, symbols[symbol_index]);
+            }
+            relocation->symbol_name = symbols[symbol_index];
         }
 
         if (!strcmp(group->section_name, ".rel.text")
@@ -2190,7 +2305,7 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
 #endif
         ) {
 #if !defined(BH_PLATFORM_LINUX) && !defined(BH_PLATFORM_LINUX_SGX) \
-    && !defined(BH_PLATFORM_DARWIN)
+    && !defined(BH_PLATFORM_DARWIN) && !defined(BH_PLATFORM_WINDOWS)
             if (module->is_indirect_mode) {
                 set_error_buf(error_buf, error_buf_size,
                               "cannot apply relocation to text section "
@@ -2234,7 +2349,10 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
             || !strcmp(data_section->name, ".rodata")
             /* ".rodata.cst4/8/16/.." */
             || !strncmp(data_section->name, ".rodata.cst",
-                        strlen(".rodata.cst"))) {
+                        strlen(".rodata.cst"))
+            /* ".rodata.strn.m" */
+            || !strncmp(data_section->name, ".rodata.str",
+                        strlen(".rodata.str"))) {
             os_mprotect(data_section->data, data_section->size, map_prot);
         }
     }
@@ -2242,6 +2360,9 @@ load_relocation_section(const uint8 *buf, const uint8 *buf_end,
     ret = true;
 
 fail:
+    if (symbols) {
+        wasm_runtime_free(symbols);
+    }
     if (groups) {
         for (i = 0, group = groups; i < group_count; i++, group++)
             if (group->relocations)
@@ -2706,6 +2827,90 @@ aot_load_from_aot_file(const uint8 *buf, uint32 size, char *error_buf,
 }
 
 #if WASM_ENABLE_JIT != 0
+#if WASM_ENABLE_LAZY_JIT != 0
+/* Orc JIT thread arguments */
+typedef struct OrcJitThreadArg {
+    AOTCompData *comp_data;
+    AOTCompContext *comp_ctx;
+    AOTModule *module;
+    int32 group_idx;
+    int32 group_stride;
+} OrcJitThreadArg;
+
+static bool orcjit_stop_compiling = false;
+static korp_tid orcjit_threads[WASM_LAZY_JIT_COMPILE_THREAD_NUM];
+static OrcJitThreadArg orcjit_thread_args[WASM_LAZY_JIT_COMPILE_THREAD_NUM];
+
+static void *
+orcjit_thread_callback(void *arg)
+{
+    LLVMErrorRef error;
+    LLVMOrcJITTargetAddress func_addr = 0;
+    OrcJitThreadArg *thread_arg = (OrcJitThreadArg *)arg;
+    AOTCompData *comp_data = thread_arg->comp_data;
+    AOTCompContext *comp_ctx = thread_arg->comp_ctx;
+    AOTModule *module = thread_arg->module;
+    char func_name[32];
+    int32 i;
+
+    /* Compile wasm functions of this group */
+    for (i = thread_arg->group_idx; i < (int32)comp_data->func_count;
+         i += thread_arg->group_stride) {
+        if (!module->func_ptrs[i]) {
+            snprintf(func_name, sizeof(func_name), "%s%d", AOT_FUNC_PREFIX, i);
+            if ((error = LLVMOrcLLJITLookup(comp_ctx->orc_lazyjit, &func_addr,
+                                            func_name))) {
+                char *err_msg = LLVMGetErrorMessage(error);
+                os_printf("failed to compile orc jit function: %s", err_msg);
+                LLVMDisposeErrorMessage(err_msg);
+                break;
+            }
+            /**
+             * No need to lock the func_ptr[func_idx] here as it is basic
+             * data type, the load/store for it can be finished by one cpu
+             * instruction, and there can be only one cpu instruction
+             * loading/storing at the same time.
+             */
+            module->func_ptrs[i] = (void *)func_addr;
+        }
+        if (orcjit_stop_compiling) {
+            break;
+        }
+    }
+
+    /* Try to compile functions that haven't been compiled by other threads */
+    for (i = (int32)comp_data->func_count - 1; i > 0; i--) {
+        if (orcjit_stop_compiling) {
+            break;
+        }
+        if (!module->func_ptrs[i]) {
+            snprintf(func_name, sizeof(func_name), "%s%d", AOT_FUNC_PREFIX, i);
+            if ((error = LLVMOrcLLJITLookup(comp_ctx->orc_lazyjit, &func_addr,
+                                            func_name))) {
+                char *err_msg = LLVMGetErrorMessage(error);
+                os_printf("failed to compile orc jit function: %s", err_msg);
+                LLVMDisposeErrorMessage(err_msg);
+                break;
+            }
+            module->func_ptrs[i] = (void *)func_addr;
+        }
+    }
+
+    return NULL;
+}
+
+static void
+orcjit_stop_compile_threads()
+{
+    uint32 i;
+
+    orcjit_stop_compiling = true;
+    for (i = 0; i < WASM_LAZY_JIT_COMPILE_THREAD_NUM; i++) {
+        os_thread_join(orcjit_threads[i], NULL);
+    }
+}
+#endif
+
 static AOTModule *
 aot_load_from_comp_data(AOTCompData *comp_data, AOTCompContext *comp_ctx,
                         char *error_buf, uint32 error_buf_size)
@@ -2714,13 +2919,6 @@ aot_load_from_comp_data(AOTCompData *comp_data, AOTCompContext *comp_ctx,
     uint64 size;
     char func_name[32];
     AOTModule *module;
-
-#if WASM_ENABLE_LAZY_JIT != 0
-    LLVMOrcThreadSafeModuleRef ts_module;
-    LLVMOrcJITDylibRef main_dylib;
-    LLVMErrorRef error;
-    LLVMOrcJITTargetAddress func_addr = 0;
-#endif
 
     /* Allocate memory for module */
     if (!(module =
@@ -2785,44 +2983,28 @@ aot_load_from_comp_data(AOTCompData *comp_data, AOTCompContext *comp_ctx,
     }
 
 #if WASM_ENABLE_LAZY_JIT != 0
-    bh_assert(comp_ctx->lazy_orcjit);
+    /* Create threads to compile the wasm functions */
+    for (i = 0; i < WASM_LAZY_JIT_COMPILE_THREAD_NUM; i++) {
+        orcjit_thread_args[i].comp_data = comp_data;
+        orcjit_thread_args[i].comp_ctx = comp_ctx;
+        orcjit_thread_args[i].module = module;
+        orcjit_thread_args[i].group_idx = (int32)i;
+        orcjit_thread_args[i].group_stride = WASM_LAZY_JIT_COMPILE_THREAD_NUM;
+        if (os_thread_create(&orcjit_threads[i], orcjit_thread_callback,
+                             (void *)&orcjit_thread_args[i],
+                             APP_THREAD_STACK_SIZE_DEFAULT)
+            != 0) {
+            uint32 j;
 
-    main_dylib = LLVMOrcLLLazyJITGetMainJITDylib(comp_ctx->lazy_orcjit);
-    if (!main_dylib) {
-        set_error_buf(error_buf, error_buf_size,
-                      "failed to get dynmaic library reference");
-        goto fail3;
-    }
-
-    ts_module = LLVMOrcCreateNewThreadSafeModule(comp_ctx->module,
-                                                 comp_ctx->ts_context);
-    if (!ts_module) {
-        set_error_buf(error_buf, error_buf_size,
-                      "failed to create thread safe module");
-        goto fail3;
-    }
-
-    if ((error = LLVMOrcLLLazyJITAddLLVMIRModule(comp_ctx->lazy_orcjit,
-                                                 main_dylib, ts_module))) {
-        /*
-         * If adding the ThreadSafeModule fails then we need to clean it up
-         * ourselves. If adding it succeeds the JIT will manage the memory.
-         */
-        aot_handle_llvm_errmsg(error_buf, error_buf_size,
-                               "failed to addIRModule: ", error);
-        goto fail4;
-    }
-
-    for (i = 0; i < comp_data->func_count; i++) {
-        snprintf(func_name, sizeof(func_name), "%s%d", AOT_FUNC_PREFIX, i);
-        if ((error = LLVMOrcLLLazyJITLookup(comp_ctx->lazy_orcjit, &func_addr,
-                                            func_name))) {
-            aot_handle_llvm_errmsg(error_buf, error_buf_size,
-                                   "cannot lookup: ", error);
+            set_error_buf(error_buf, error_buf_size,
+                          "create orcjit compile thread failed");
+            /* Terminate the threads created */
+            orcjit_stop_compiling = true;
+            for (j = 0; j < i; j++) {
+                os_thread_join(orcjit_threads[j], NULL);
+            }
             goto fail3;
         }
-        module->func_ptrs[i] = (void *)func_addr;
-        func_addr = 0;
     }
 #else
     /* Resolve function addresses */
@@ -2843,7 +3025,7 @@ aot_load_from_comp_data(AOTCompData *comp_data, AOTCompContext *comp_ctx,
     if (size > 0
         && !(module->func_type_indexes =
                  loader_malloc(size, error_buf, error_buf_size))) {
-        goto fail3;
+        goto fail4;
     }
     for (i = 0; i < comp_data->func_count; i++)
         module->func_type_indexes[i] = comp_data->funcs[i]->func_type_index;
@@ -2857,6 +3039,29 @@ aot_load_from_comp_data(AOTCompData *comp_data, AOTCompContext *comp_ctx,
                   < module->import_func_count + module->func_count);
         /* TODO: fix issue that start func cannot be import func */
         if (comp_data->start_func_index >= module->import_func_count) {
+#if WASM_ENABLE_LAZY_JIT != 0
+            if (!module->func_ptrs[comp_data->start_func_index
+                                   - module->import_func_count]) {
+                LLVMErrorRef error;
+                LLVMOrcJITTargetAddress func_addr = 0;
+
+                snprintf(func_name, sizeof(func_name), "%s%d", AOT_FUNC_PREFIX,
+                         comp_data->start_func_index
+                             - module->import_func_count);
+                if ((error = LLVMOrcLLJITLookup(comp_ctx->orc_lazyjit,
+                                                &func_addr, func_name))) {
+                    char *err_msg = LLVMGetErrorMessage(error);
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "failed to compile orc jit function: %s",
+                                    err_msg);
+                    LLVMDisposeErrorMessage(err_msg);
+                    goto fail5;
+                }
+                module->func_ptrs[comp_data->start_func_index
+                                  - module->import_func_count] =
+                    (void *)func_addr;
+            }
+#endif
             module->start_function =
                 module->func_ptrs[comp_data->start_func_index
                                   - module->import_func_count];
@@ -2885,16 +3090,22 @@ aot_load_from_comp_data(AOTCompData *comp_data, AOTCompContext *comp_ctx,
     module->comp_data = comp_data;
 
 #if WASM_ENABLE_LIBC_WASI != 0
-    module->is_wasi_module = comp_data->wasm_module->is_wasi_module;
+    module->import_wasi_api = comp_data->wasm_module->import_wasi_api;
 #endif
 
     return module;
 
 #if WASM_ENABLE_LAZY_JIT != 0
-fail4:
-    LLVMOrcDisposeThreadSafeModule(ts_module);
+fail5:
+    if (module->func_type_indexes)
+        wasm_runtime_free(module->func_type_indexes);
 #endif
 
+fail4:
+#if WASM_ENABLE_LAZY_JIT != 0
+    /* Terminate all threads before free module->func_ptrs */
+    orcjit_stop_compile_threads();
+#endif
 fail3:
     if (module->func_ptrs)
         wasm_runtime_free(module->func_ptrs);
@@ -2980,6 +3191,10 @@ void
 aot_unload(AOTModule *module)
 {
 #if WASM_ENABLE_JIT != 0
+#if WASM_ENABLE_LAZY_JIT != 0
+    orcjit_stop_compile_threads();
+#endif
+
     if (module->comp_data)
         aot_destroy_comp_data(module->comp_data);
 
@@ -3074,8 +3289,12 @@ aot_unload(AOTModule *module)
         wasm_runtime_free(module->aux_func_indexes);
     }
     if (module->aux_func_names) {
-        wasm_runtime_free(module->aux_func_names);
+        wasm_runtime_free((void *)module->aux_func_names);
     }
+#endif
+
+#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+    wasm_runtime_destroy_custom_sections(module->custom_section_list);
 #endif
 
     wasm_runtime_free(module);
@@ -3086,3 +3305,24 @@ aot_get_plt_table_size()
 {
     return get_plt_table_size();
 }
+
+#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+const uint8 *
+aot_get_custom_section(const AOTModule *module, const char *name, uint32 *len)
+{
+    WASMCustomSection *section = module->custom_section_list;
+
+    while (section) {
+        if (strcmp(section->name_addr, name) == 0) {
+            if (len) {
+                *len = section->content_len;
+            }
+            return section->content_addr;
+        }
+
+        section = section->next;
+    }
+
+    return NULL;
+}
+#endif /* end of WASM_ENABLE_LOAD_CUSTOM_SECTION */

@@ -32,23 +32,26 @@ aot_compile_op_get_local(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 {
     char name[32];
     LLVMValueRef value;
-    AOTValue *aot_value;
+    AOTValue *aot_value_top;
+    uint8 local_type;
 
     CHECK_LOCAL(local_idx);
 
+    local_type = get_local_type(func_ctx, local_idx);
+
     snprintf(name, sizeof(name), "%s%d%s", "local", local_idx, "#");
-    if (!(value = LLVMBuildLoad(comp_ctx->builder, func_ctx->locals[local_idx],
-                                name))) {
+    if (!(value = LLVMBuildLoad2(comp_ctx->builder, TO_LLVM_TYPE(local_type),
+                                 func_ctx->locals[local_idx], name))) {
         aot_set_last_error("llvm build load fail");
         return false;
     }
 
-    PUSH(value, get_local_type(func_ctx, local_idx));
+    PUSH(value, local_type);
 
-    aot_value =
+    aot_value_top =
         func_ctx->block_stack.block_list_end->value_stack.value_list_end;
-    aot_value->is_local = true;
-    aot_value->local_idx = local_idx;
+    aot_value_top->is_local = true;
+    aot_value_top->local_idx = local_idx;
     return true;
 
 fail:
@@ -134,9 +137,9 @@ compile_global(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
     offset = I32_CONST(global_offset);
-    if (!(global_ptr =
-              LLVMBuildInBoundsGEP(comp_ctx->builder, func_ctx->aot_inst,
-                                   &offset, 1, "global_ptr_tmp"))) {
+    if (!(global_ptr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                             func_ctx->aot_inst, &offset, 1,
+                                             "global_ptr_tmp"))) {
         aot_set_last_error("llvm build in bounds gep failed.");
         return false;
     }
@@ -172,7 +175,8 @@ compile_global(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
     if (!is_set) {
         if (!(global =
-                  LLVMBuildLoad(comp_ctx->builder, global_ptr, "global"))) {
+                  LLVMBuildLoad2(comp_ctx->builder, TO_LLVM_TYPE(global_type),
+                                 global_ptr, "global"))) {
             aot_set_last_error("llvm build load failed.");
             return false;
         }

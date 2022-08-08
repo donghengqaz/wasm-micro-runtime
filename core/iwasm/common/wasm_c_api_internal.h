@@ -27,6 +27,7 @@ WASM_DECLARE_VEC(store, *)
 struct wasm_engine_t {
     /* support one store for now */
     wasm_store_vec_t *stores;
+    uint32_t ref_count;
 };
 
 struct wasm_store_t {
@@ -56,7 +57,6 @@ struct wasm_globaltype_t {
 
 struct wasm_tabletype_t {
     uint32 extern_kind;
-    /* always be WASM_FUNCREF */
     wasm_valtype_t *val_type;
     wasm_limits_t limits;
 };
@@ -206,7 +206,6 @@ struct wasm_extern_t {
 
 struct wasm_instance_t {
     wasm_store_t *store;
-    wasm_extern_vec_t *imports;
     wasm_extern_vec_t *exports;
     struct wasm_host_info host_info;
     WASMModuleInstanceCommon *inst_comm_rt;

@@ -81,6 +81,10 @@
 #define WASM_ENABLE_LAZY_JIT 0
 #endif
 
+#ifndef WASM_LAZY_JIT_COMPILE_THREAD_NUM
+#define WASM_LAZY_JIT_COMPILE_THREAD_NUM 4
+#endif
+
 #if (WASM_ENABLE_AOT == 0) && (WASM_ENABLE_JIT != 0)
 /* LazyJIT or MCJIT can only be enabled when AOT is enabled */
 #undef WASM_ENABLE_JIT
@@ -90,8 +94,28 @@
 #define WASM_ENABLE_LAZY_JIT 0
 #endif
 
+#ifndef WASM_ENABLE_FAST_JIT
+#define WASM_ENABLE_FAST_JIT 0
+#endif
+
+#ifndef WASM_ENABLE_FAST_JIT_DUMP
+#define WASM_ENABLE_FAST_JIT_DUMP 0
+#endif
+
+#ifndef FAST_JIT_DEFAULT_CODE_CACHE_SIZE
+#define FAST_JIT_DEFAULT_CODE_CACHE_SIZE 10 * 1024 * 1024
+#endif
+
 #ifndef WASM_ENABLE_WAMR_COMPILER
 #define WASM_ENABLE_WAMR_COMPILER 0
+#endif
+
+#if WASM_ENABLE_WAMR_COMPILER != 0
+#ifndef WASM_ENABLE_LLVM_LEGACY_PM
+/* Whether to use LLVM legacy pass manager when building wamrc,
+   by default it is disabled and LLVM new pass manager is used */
+#define WASM_ENABLE_LLVM_LEGACY_PM 0
+#endif
 #endif
 
 #ifndef WASM_ENABLE_LIBC_BUILTIN
@@ -143,8 +167,22 @@
 #define WASM_ENABLE_DEBUG_INTERP 0
 #endif
 
+#if WASM_ENABLE_DEBUG_INTERP != 0
+#ifndef DEBUG_EXECUTION_MEMORY_SIZE
+/* 0x85000 is the size required by lldb, if this is changed to a smaller value,
+ * then the debugger will not be able to evaluate user expressions, other
+ * functionality such as breakpoint and stepping are not influenced by this */
+#define DEBUG_EXECUTION_MEMORY_SIZE 0x85000
+#endif
+#endif /* end of WASM_ENABLE_DEBUG_INTERP != 0 */
+
 #ifndef WASM_ENABLE_DEBUG_AOT
 #define WASM_ENABLE_DEBUG_AOT 0
+#endif
+
+/* Custom sections */
+#ifndef WASM_ENABLE_LOAD_CUSTOM_SECTION
+#define WASM_ENABLE_LOAD_CUSTOM_SECTION 0
 #endif
 
 /* WASM log system */
@@ -273,7 +311,9 @@
 /* Min auxilliary stack size of each wasm thread */
 #define WASM_THREAD_AUX_STACK_SIZE_MIN (256)
 
-/* Default/min/max stack size of each app thread */
+/* Default/min native stack size of each app thread */
+#if !(defined(APP_THREAD_STACK_SIZE_DEFAULT) \
+      && defined(APP_THREAD_STACK_SIZE_MIN))
 #if defined(BH_PLATFORM_ZEPHYR) || defined(BH_PLATFORM_ALIOS_THINGS) \
     || defined(BH_PLATFORM_ESP_IDF) || defined(BH_PLATFORM_OPENRTOS)
 #define APP_THREAD_STACK_SIZE_DEFAULT (6 * 1024)
@@ -281,20 +321,37 @@
 #elif defined(PTHREAD_STACK_DEFAULT) && defined(PTHREAD_STACK_MIN)
 #define APP_THREAD_STACK_SIZE_DEFAULT PTHREAD_STACK_DEFAULT
 #define APP_THREAD_STACK_SIZE_MIN PTHREAD_STACK_MIN
+#elif WASM_ENABLE_UVWASI != 0
+/* UVWASI requires larger native stack */
+#define APP_THREAD_STACK_SIZE_DEFAULT (64 * 1024)
+#define APP_THREAD_STACK_SIZE_MIN (48 * 1024)
 #else
 #define APP_THREAD_STACK_SIZE_DEFAULT (32 * 1024)
 #define APP_THREAD_STACK_SIZE_MIN (24 * 1024)
 #endif
+#endif /* end of !(defined(APP_THREAD_STACK_SIZE_DEFAULT) \
+                   && defined(APP_THREAD_STACK_SIZE_MIN)) */
+
+/* Max native stack size of each app thread */
 #if !defined(APP_THREAD_STACK_SIZE_MAX)
 #define APP_THREAD_STACK_SIZE_MAX (8 * 1024 * 1024)
 #endif
 
 /* Reserved bytes to the native thread stack boundary, throw native
    stack overflow exception if the guard boudary is reached */
-#define RESERVED_BYTES_TO_NATIVE_STACK_BOUNDARY (512)
+#ifndef RESERVED_BYTES_TO_NATIVE_STACK_BOUNDARY
+#if WASM_ENABLE_UVWASI != 0
+/* UVWASI requires larger native stack */
+#define RESERVED_BYTES_TO_NATIVE_STACK_BOUNDARY (4096 * 6)
+#else
+#define RESERVED_BYTES_TO_NATIVE_STACK_BOUNDARY (1024)
+#endif
+#endif
 
 /* Guard page count for stack overflow check with hardware trap */
+#ifndef STACK_OVERFLOW_CHECK_GUARD_PAGE_COUNT
 #define STACK_OVERFLOW_CHECK_GUARD_PAGE_COUNT 3
+#endif
 
 /* Default wasm block address cache size and conflict list size */
 #ifndef BLOCK_ADDR_CACHE_SIZE

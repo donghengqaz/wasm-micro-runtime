@@ -6,17 +6,12 @@
 #ifndef PACKETS_H
 #define PACKETS_H
 
-#include <stdint.h>
-#include <unistd.h>
 #include "gdbserver.h"
 
-bool
-read_packet(WASMGDBServer *gdbserver);
+void
+write_data_raw(WASMGDBServer *gdbserver, const uint8 *data, ssize_t len);
 
 void
 write_packet(WASMGDBServer *gdbserver, const char *data);
-
-void
-inbuf_erase_head(WASMGDBServer *gdbserver, ssize_t end);
 
 #endif

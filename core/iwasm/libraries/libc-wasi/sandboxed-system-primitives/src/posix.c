@@ -60,6 +60,7 @@ static_assert(sizeof(struct iovec) == sizeof(__wasi_ciovec_t),
 static __thread struct fd_table *curfds;
 static __thread struct fd_prestats *prestats;
 static __thread struct argv_environ_values *argv_environ;
+static __thread struct addr_pool *addr_pool;
 #endif
 
 // Converts a POSIX error code to a CloudABI error code.
@@ -180,15 +181,19 @@ convert_clockid(__wasi_clockid_t in, clockid_t *out)
         case __WASI_CLOCK_MONOTONIC:
             *out = CLOCK_MONOTONIC;
             return true;
+#if defined(CLOCK_PROCESS_CPUTIME_ID)
         case __WASI_CLOCK_PROCESS_CPUTIME_ID:
             *out = CLOCK_PROCESS_CPUTIME_ID;
             return true;
+#endif
         case __WASI_CLOCK_REALTIME:
             *out = CLOCK_REALTIME;
             return true;
+#if defined(CLOCK_THREAD_CPUTIME_ID)
         case __WASI_CLOCK_THREAD_CPUTIME_ID:
             *out = CLOCK_THREAD_CPUTIME_ID;
             return true;
+#endif
         default:
             return false;
     }
@@ -651,12 +656,13 @@ fd_table_insert_fd(struct fd_table *ft, int in, __wasi_filetype_t type,
     REQUIRES_UNLOCKED(ft->lock)
 {
     struct fd_object *fo;
-    __wasi_errno_t error = fd_object_new(type, &fo);
 
+    __wasi_errno_t error = fd_object_new(type, &fo);
     if (error != 0) {
         close(in);
         return error;
     }
+
     fo->number = in;
     if (type == __WASI_FILETYPE_DIRECTORY) {
         if (!mutex_init(&fo->directory.lock)) {
@@ -876,7 +882,7 @@ wasmtime_ssp_fd_pread(
         // Copy data back to vectors.
         size_t bufoff = 0;
         for (size_t i = 0; i < iovcnt; ++i) {
-            if (bufoff + iov[i].buf_len < len) {
+            if (bufoff + iov[i].buf_len < (size_t)len) {
                 bh_memcpy_s(iov[i].buf, iov[i].buf_len, buf + bufoff,
                             iov[i].buf_len);
                 bufoff += iov[i].buf_len;
@@ -1355,8 +1361,9 @@ wasmtime_ssp_fd_allocate(
     // conditions. We may end up shrinking the file right now.
     struct stat sb;
     int ret = fstat(fd_number(fo), &sb);
-    if (ret == 0 && sb.st_size < offset + len)
-        ret = ftruncate(fd_number(fo), offset + len);
+    off_t newsize = (off_t)(offset + len);
+    if (ret == 0 && sb.st_size < newsize)
+        ret = ftruncate(fd_number(fo), newsize);
 #endif
 
     fd_object_release(fo);
@@ -1990,7 +1997,11 @@ wasmtime_ssp_fd_readdir(
         size_t namlen = strlen(de->d_name);
         __wasi_dirent_t cde = {
             .d_next = fo->directory.offset,
+#if CONFIG_HAS_D_INO
             .d_ino = de->d_ino,
+#else
+            .d_ino = 0,
+#endif
             .d_namlen = (uint32)namlen,
         };
         switch (de->d_type) {
@@ -2418,19 +2429,19 @@ wasmtime_ssp_poll_oneoff(
     size_t *nevents) NO_LOCK_ANALYSIS
 {
     // Sleeping.
-    if (nsubscriptions == 1 && in[0].type == __WASI_EVENTTYPE_CLOCK) {
+    if (nsubscriptions == 1 && in[0].u.type == __WASI_EVENTTYPE_CLOCK) {
         out[0] = (__wasi_event_t){
             .userdata = in[0].userdata,
-            .type = in[0].type,
+            .type = in[0].u.type,
         };
 #if CONFIG_HAS_CLOCK_NANOSLEEP
         clockid_t clock_id;
-        if (convert_clockid(in[0].u.clock.clock_id, &clock_id)) {
+        if (convert_clockid(in[0].u.u.clock.clock_id, &clock_id)) {
             struct timespec ts;
-            convert_timestamp(in[0].u.clock.timeout, &ts);
+            convert_timestamp(in[0].u.u.clock.timeout, &ts);
             int ret = clock_nanosleep(
                 clock_id,
-                (in[0].u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME) != 0
+                (in[0].u.u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME) != 0
                     ? TIMER_ABSTIME
                     : 0,
                 &ts, NULL);
@@ -2441,9 +2452,9 @@ wasmtime_ssp_poll_oneoff(
             out[0].error = __WASI_ENOTSUP;
         }
 #else
-        switch (in[0].u.clock.clock_id) {
+        switch (in[0].u.u.clock.clock_id) {
             case __WASI_CLOCK_MONOTONIC:
-                if ((in[0].u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME)
+                if ((in[0].u.u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME)
                     != 0) {
                     // TODO(ed): Implement.
                     fputs("Unimplemented absolute sleep on monotonic clock\n",
@@ -2454,12 +2465,12 @@ wasmtime_ssp_poll_oneoff(
                     // Perform relative sleeps on the monotonic clock also using
                     // nanosleep(). This is incorrect, but good enough for now.
                     struct timespec ts;
-                    convert_timestamp(in[0].u.clock.timeout, &ts);
+                    convert_timestamp(in[0].u.u.clock.timeout, &ts);
                     nanosleep(&ts, NULL);
                 }
                 break;
             case __WASI_CLOCK_REALTIME:
-                if ((in[0].u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME)
+                if ((in[0].u.u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME)
                     != 0) {
                     // Sleeping to an absolute point in time can only be done
                     // by waiting on a condition variable.
@@ -2473,7 +2484,8 @@ wasmtime_ssp_poll_oneoff(
                         return -1;
                     }
                     mutex_lock(&mutex);
-                    cond_timedwait(&cond, &mutex, in[0].u.clock.timeout, true);
+                    cond_timedwait(&cond, &mutex, in[0].u.u.clock.timeout,
+                                   true);
                     mutex_unlock(&mutex);
                     mutex_destroy(&mutex);
                     cond_destroy(&cond);
@@ -2481,7 +2493,7 @@ wasmtime_ssp_poll_oneoff(
                 else {
                     // Relative sleeps can be done using nanosleep().
                     struct timespec ts;
-                    convert_timestamp(in[0].u.clock.timeout, &ts);
+                    convert_timestamp(in[0].u.u.clock.timeout, &ts);
                     nanosleep(&ts, NULL);
                 }
                 break;
@@ -2519,18 +2531,18 @@ wasmtime_ssp_poll_oneoff(
     const __wasi_subscription_t *clock_subscription = NULL;
     for (size_t i = 0; i < nsubscriptions; ++i) {
         const __wasi_subscription_t *s = &in[i];
-        switch (s->type) {
+        switch (s->u.type) {
             case __WASI_EVENTTYPE_FD_READ:
             case __WASI_EVENTTYPE_FD_WRITE:
             {
                 __wasi_errno_t error =
-                    fd_object_get_locked(&fos[i], ft, s->u.fd_readwrite.fd,
+                    fd_object_get_locked(&fos[i], ft, s->u.u.fd_readwrite.fd,
                                          __WASI_RIGHT_POLL_FD_READWRITE, 0);
                 if (error == 0) {
                     // Proper file descriptor on which we can poll().
                     pfds[i] = (struct pollfd){
                         .fd = fd_number(fos[i]),
-                        .events = s->type == __WASI_EVENTTYPE_FD_READ
+                        .events = s->u.type == __WASI_EVENTTYPE_FD_READ
                                       ? POLLRDNORM
                                       : POLLWRNORM,
                     };
@@ -2542,14 +2554,14 @@ wasmtime_ssp_poll_oneoff(
                     out[(*nevents)++] = (__wasi_event_t){
                         .userdata = s->userdata,
                         .error = error,
-                        .type = s->type,
+                        .type = s->u.type,
                     };
                 }
                 break;
             }
             case __WASI_EVENTTYPE_CLOCK:
                 if (clock_subscription == NULL
-                    && (s->u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME)
+                    && (s->u.u.clock.flags & __WASI_SUBSCRIPTION_CLOCK_ABSTIME)
                            == 0) {
                     // Relative timeout.
                     fos[i] = NULL;
@@ -2565,7 +2577,7 @@ wasmtime_ssp_poll_oneoff(
                 out[(*nevents)++] = (__wasi_event_t){
                     .userdata = s->userdata,
                     .error = __WASI_ENOSYS,
-                    .type = s->type,
+                    .type = s->u.type,
                 };
                 break;
         }
@@ -2579,11 +2591,11 @@ wasmtime_ssp_poll_oneoff(
         timeout = 0;
     }
     else if (clock_subscription != NULL) {
-        __wasi_timestamp_t ts = clock_subscription->u.clock.timeout / 1000000;
+        __wasi_timestamp_t ts = clock_subscription->u.u.clock.timeout / 1000000;
         timeout = ts > INT_MAX ? -1 : (int)ts;
     }
     else {
-        timeout = -1;
+        timeout = 1000;
     }
     int ret = poll(pfds, nsubscriptions, timeout);
 
@@ -2603,7 +2615,7 @@ wasmtime_ssp_poll_oneoff(
         for (size_t i = 0; i < nsubscriptions; ++i) {
             if (pfds[i].fd >= 0) {
                 __wasi_filesize_t nbytes = 0;
-                if (in[i].type == __WASI_EVENTTYPE_FD_READ) {
+                if (in[i].u.type == __WASI_EVENTTYPE_FD_READ) {
                     int l;
                     if (ioctl(fd_number(fos[i]), FIONREAD, &l) == 0)
                         nbytes = (__wasi_filesize_t)l;
@@ -2622,7 +2634,7 @@ wasmtime_ssp_poll_oneoff(
 #else
                         .error = __WASI_EBADF,
 #endif
-                        .type = in[i].type,
+                        .type = in[i].u.type,
                     };
                 }
                 else if ((pfds[i].revents & POLLERR) != 0) {
@@ -2630,14 +2642,14 @@ wasmtime_ssp_poll_oneoff(
                     out[(*nevents)++] = (__wasi_event_t){
                         .userdata = in[i].userdata,
                         .error = __WASI_EIO,
-                        .type = in[i].type,
+                        .type = in[i].u.type,
                     };
                 }
                 else if ((pfds[i].revents & POLLHUP) != 0) {
                     // End-of-file.
                     out[(*nevents)++] = (__wasi_event_t){
                         .userdata = in[i].userdata,
-                        .type = in[i].type,
+                        .type = in[i].u.type,
                         .u.fd_readwrite.nbytes = nbytes,
                         .u.fd_readwrite.flags =
                             __WASI_EVENT_FD_READWRITE_HANGUP,
@@ -2647,7 +2659,7 @@ wasmtime_ssp_poll_oneoff(
                     // Read or write possible.
                     out[(*nevents)++] = (__wasi_event_t){
                         .userdata = in[i].userdata,
-                        .type = in[i].type,
+                        .type = in[i].u.type,
                         .u.fd_readwrite.nbytes = nbytes,
                     };
                 }
@@ -2680,11 +2692,84 @@ wasmtime_ssp_proc_raise(__wasi_signal_t sig)
 {
     static const int signals[] = {
 #define X(v) [__WASI_##v] = v
-        X(SIGABRT), X(SIGALRM), X(SIGBUS), X(SIGCHLD), X(SIGCONT), X(SIGFPE),
-        X(SIGHUP),  X(SIGILL),  X(SIGINT), X(SIGKILL), X(SIGPIPE), X(SIGQUIT),
-        X(SIGSEGV), X(SIGSTOP), X(SIGSYS), X(SIGTERM), X(SIGTRAP), X(SIGTSTP),
-        X(SIGTTIN), X(SIGTTOU), X(SIGURG), X(SIGUSR1), X(SIGUSR2), X(SIGVTALRM),
-        X(SIGXCPU), X(SIGXFSZ),
+#if defined(SIGABRT)
+        X(SIGABRT),
+#endif
+#if defined(SIGALRM)
+        X(SIGALRM),
+#endif
+#if defined(SIGBUS)
+        X(SIGBUS),
+#endif
+#if defined(SIGCHLD)
+        X(SIGCHLD),
+#endif
+#if defined(SIGCONT)
+        X(SIGCONT),
+#endif
+#if defined(SIGFPE)
+        X(SIGFPE),
+#endif
+#if defined(SIGHUP)
+        X(SIGHUP),
+#endif
+#if defined(SIGILL)
+        X(SIGILL),
+#endif
+#if defined(SIGINT)
+        X(SIGINT),
+#endif
+#if defined(SIGKILL)
+        X(SIGKILL),
+#endif
+#if defined(SIGPIPE)
+        X(SIGPIPE),
+#endif
+#if defined(SIGQUIT)
+        X(SIGQUIT),
+#endif
+#if defined(SIGSYS)
+        X(SIGSEGV),
+#endif
+#if defined(SIGSTOP)
+        X(SIGSTOP),
+#endif
+#if defined(SIGSYS)
+        X(SIGSYS),
+#endif
+#if defined(SIGTERM)
+        X(SIGTERM),
+#endif
+#if defined(SIGTRAP)
+        X(SIGTRAP),
+#endif
+#if defined(SIGTSTP)
+        X(SIGTSTP),
+#endif
+#if defined(SIGTTIN)
+        X(SIGTTIN),
+#endif
+#if defined(SIGTTOU)
+        X(SIGTTOU),
+#endif
+#if defined(SIGURG)
+        X(SIGURG),
+#endif
+#if defined(SIGUSR1)
+        X(SIGUSR1),
+#endif
+#if defined(SIGUSR2)
+        X(SIGUSR2),
+#endif
+#if defined(SIGVTALRM)
+        X(SIGVTALRM),
+#endif
+#if defined(SIGXCPU)
+        X(SIGXCPU),
+#endif
+#if defined(SIGXFSZ)
+        X(SIGXFSZ),
+#endif
 #undef X
     };
     if (sig >= sizeof(signals) / sizeof(signals[0]) || signals[sig] == 0)
@@ -2715,43 +2800,253 @@ wasmtime_ssp_random_get(void *buf, size_t nbyte)
 }
 
 __wasi_errno_t
+wasi_ssp_sock_accept(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds,
+#endif
+    __wasi_fd_t fd, __wasi_fd_t *fd_new)
+{
+    __wasi_filetype_t wasi_type;
+    __wasi_rights_t max_base, max_inheriting;
+    struct fd_object *fo;
+    bh_socket_t new_sock = -1;
+    int ret;
+    __wasi_errno_t error =
+        fd_object_get(curfds, &fo, fd, __WASI_RIGHT_SOCK_ACCEPT, 0);
+    if (error != __WASI_ESUCCESS) {
+        goto fail;
+    }
+
+    ret = os_socket_accept(fd_number(fo), &new_sock, NULL, NULL);
+    fd_object_release(fo);
+    if (BHT_OK != ret) {
+        error = convert_errno(errno);
+        goto fail;
+    }
+
+    error = fd_determine_type_rights(new_sock, &wasi_type, &max_base,
+                                     &max_inheriting);
+    if (error != __WASI_ESUCCESS) {
+        goto fail;
+    }
+
+    error = fd_table_insert_fd(curfds, new_sock, wasi_type, max_base,
+                               max_inheriting, fd_new);
+    if (error != __WASI_ESUCCESS) {
+        /* released in fd_table_insert_fd() */
+        new_sock = -1;
+        goto fail;
+    }
+
+    return __WASI_ESUCCESS;
+
+fail:
+    if (-1 != new_sock) {
+        os_socket_close(new_sock);
+    }
+    return error;
+}
+
+__wasi_errno_t
+wasi_ssp_sock_addr_local(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds,
+#endif
+    __wasi_fd_t fd, uint8 *buf, __wasi_size_t buf_len)
+{
+    struct fd_object *fo;
+    __wasi_errno_t error =
+        fd_object_get(curfds, &fo, fd, __WASI_RIGHT_SOCK_ADDR_LOCAL, 0);
+    if (error != __WASI_ESUCCESS)
+        return error;
+
+    fd_object_release(fo);
+    return __WASI_ENOSYS;
+}
+
+__wasi_errno_t
+wasi_ssp_sock_addr_remote(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds,
+#endif
+    __wasi_fd_t fd, uint8 *buf, __wasi_size_t buf_len)
+{
+    struct fd_object *fo;
+    __wasi_errno_t error =
+        fd_object_get(curfds, &fo, fd, __WASI_RIGHT_SOCK_ADDR_REMOTE, 0);
+    if (error != __WASI_ESUCCESS)
+        return error;
+
+    fd_object_release(fo);
+    return __WASI_ENOSYS;
+}
+
+__wasi_errno_t
+wasi_ssp_sock_bind(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds, struct addr_pool *addr_pool,
+#endif
+    __wasi_fd_t fd, __wasi_addr_t *addr)
+{
+    char buf[24] = { 0 };
+    const char *format = "%u.%u.%u.%u";
+    struct fd_object *fo;
+    __wasi_errno_t error;
+    int port = addr->addr.ip4.port;
+    int ret;
+
+    snprintf(buf, 24, format, addr->addr.ip4.addr.n0, addr->addr.ip4.addr.n1,
+             addr->addr.ip4.addr.n2, addr->addr.ip4.addr.n3);
+
+    if (!addr_pool_search(addr_pool, buf)) {
+        return __WASI_EACCES;
+    }
+
+    error = fd_object_get(curfds, &fo, fd, __WASI_RIGHT_SOCK_BIND, 0);
+    if (error != __WASI_ESUCCESS)
+        return error;
+
+    ret = os_socket_bind(fd_number(fo), buf, &port);
+    fd_object_release(fo);
+    if (BHT_OK != ret) {
+        return convert_errno(errno);
+    }
+
+    return __WASI_ESUCCESS;
+}
+
+__wasi_errno_t
+wasi_ssp_sock_connect(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds, struct addr_pool *addr_pool,
+#endif
+    __wasi_fd_t fd, __wasi_addr_t *addr)
+{
+    char buf[24] = { 0 };
+    const char *format = "%u.%u.%u.%u";
+    struct fd_object *fo;
+    __wasi_errno_t error;
+    int ret;
+
+    snprintf(buf, 24, format, addr->addr.ip4.addr.n0, addr->addr.ip4.addr.n1,
+             addr->addr.ip4.addr.n2, addr->addr.ip4.addr.n3);
+
+    if (!addr_pool_search(addr_pool, buf)) {
+        return __WASI_EACCES;
+    }
+
+    error = fd_object_get(curfds, &fo, fd, __WASI_RIGHT_SOCK_BIND, 0);
+    if (error != __WASI_ESUCCESS)
+        return error;
+
+    ret = os_socket_connect(fd_number(fo), buf, addr->addr.ip4.port);
+    fd_object_release(fo);
+    if (BHT_OK != ret) {
+        return convert_errno(errno);
+    }
+
+    return __WASI_ESUCCESS;
+}
+
+__wasi_errno_t
+wasi_ssp_sock_listen(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds,
+#endif
+    __wasi_fd_t fd, __wasi_size_t backlog)
+{
+    struct fd_object *fo;
+    int ret;
+    __wasi_errno_t error =
+        fd_object_get(curfds, &fo, fd, __WASI_RIGHT_SOCK_LISTEN, 0);
+    if (error != __WASI_ESUCCESS)
+        return error;
+
+    ret = os_socket_listen(fd_number(fo), backlog);
+    fd_object_release(fo);
+    if (BHT_OK != ret) {
+        return convert_errno(errno);
+    }
+
+    return __WASI_ESUCCESS;
+}
+
+__wasi_errno_t
+wasi_ssp_sock_open(
+#if !defined(WASMTIME_SSP_STATIC_CURFDS)
+    struct fd_table *curfds,
+#endif
+    __wasi_fd_t poolfd, __wasi_address_family_t af, __wasi_sock_type_t socktype,
+    __wasi_fd_t *sockfd)
+{
+    bh_socket_t sock;
+    int tcp_or_udp = 0;
+    int ret;
+    __wasi_filetype_t wasi_type;
+    __wasi_rights_t max_base, max_inheriting;
+    __wasi_errno_t error;
+
+    (void)poolfd;
+
+    if (INET4 != af) {
+        return __WASI_EAFNOSUPPORT;
+    }
+
+    tcp_or_udp = SOCKET_DGRAM == socktype ? 0 : 1;
+
+    ret = os_socket_create(&sock, tcp_or_udp);
+    if (BHT_OK != ret) {
+        return convert_errno(errno);
+    }
+
+    error =
+        fd_determine_type_rights(sock, &wasi_type, &max_base, &max_inheriting);
+    if (error != __WASI_ESUCCESS) {
+        os_socket_close(sock);
+        return error;
+    }
+
+    if (SOCKET_DGRAM == socktype) {
+        assert(wasi_type == __WASI_FILETYPE_SOCKET_DGRAM);
+    }
+    else {
+        assert(wasi_type == __WASI_FILETYPE_SOCKET_STREAM);
+    }
+
+    // TODO: base rights and inheriting rights ?
+    error = fd_table_insert_fd(curfds, sock, wasi_type, max_base,
+                               max_inheriting, sockfd);
+    if (error != __WASI_ESUCCESS) {
+        return error;
+    }
+
+    return __WASI_ESUCCESS;
+}
+
+__wasi_errno_t
 wasmtime_ssp_sock_recv(
 #if !defined(WASMTIME_SSP_STATIC_CURFDS)
     struct fd_table *curfds,
 #endif
-    __wasi_fd_t sock, const __wasi_iovec_t *ri_data, size_t ri_data_len,
-    __wasi_riflags_t ri_flags, size_t *ro_datalen, __wasi_roflags_t *ro_flags)
+    __wasi_fd_t sock, void *buf, size_t buf_len, size_t *recv_len)
 {
-    // Convert input to msghdr.
-    struct msghdr hdr = {
-        .msg_iov = (struct iovec *)ri_data,
-        .msg_iovlen = ri_data_len,
-    };
-    int nflags = 0;
-    if ((ri_flags & __WASI_SOCK_RECV_PEEK) != 0)
-        nflags |= MSG_PEEK;
-    if ((ri_flags & __WASI_SOCK_RECV_WAITALL) != 0)
-        nflags |= MSG_WAITALL;
-
     struct fd_object *fo;
-    __wasi_errno_t error =
-        fd_object_get(curfds, &fo, sock, __WASI_RIGHT_FD_READ, 0);
+    __wasi_errno_t error;
+    int ret;
+
+    error = fd_object_get(curfds, &fo, sock, __WASI_RIGHT_FD_READ, 0);
     if (error != 0) {
         return error;
     }
 
-    ssize_t datalen = recvmsg(fd_number(fo), &hdr, nflags);
+    ret = os_socket_recv(fd_number(fo), buf, buf_len);
     fd_object_release(fo);
-    if (datalen < 0) {
+    if (-1 == ret) {
         return convert_errno(errno);
     }
 
-    // Convert msghdr to output.
-    *ro_datalen = (size_t)datalen;
-    *ro_flags = 0;
-    if ((hdr.msg_flags & MSG_TRUNC) != 0)
-        *ro_flags |= __WASI_SOCK_RECV_DATA_TRUNCATED;
-    return 0;
+    *recv_len = (size_t)ret;
+    return __WASI_ESUCCESS;
 }
 
 __wasi_errno_t
@@ -2759,34 +3054,25 @@ wasmtime_ssp_sock_send(
 #if !defined(WASMTIME_SSP_STATIC_CURFDS)
     struct fd_table *curfds,
 #endif
-    __wasi_fd_t sock, const __wasi_ciovec_t *si_data, size_t si_data_len,
-    __wasi_siflags_t si_flags, size_t *so_datalen) NO_LOCK_ANALYSIS
+    __wasi_fd_t sock, const void *buf, size_t buf_len, size_t *sent_len)
 {
-    // Convert input to msghdr.
-    struct msghdr hdr = {
-        .msg_iov = (struct iovec *)si_data,
-        .msg_iovlen = si_data_len,
-    };
-
-    // Attach file descriptors if present.
-    __wasi_errno_t error;
-
-    // Send message.
     struct fd_object *fo;
+    __wasi_errno_t error;
+    int ret;
+
     error = fd_object_get(curfds, &fo, sock, __WASI_RIGHT_FD_WRITE, 0);
-    if (error != 0)
-        goto out;
-    ssize_t len = sendmsg(fd_number(fo), &hdr, 0);
-    fd_object_release(fo);
-    if (len < 0) {
-        error = convert_errno(errno);
-    }
-    else {
-        *so_datalen = (size_t)len;
+    if (error != 0) {
+        return error;
     }
 
-out:
-    return error;
+    ret = os_socket_send(fd_number(fo), buf, buf_len);
+    fd_object_release(fo);
+    if (-1 == ret) {
+        return convert_errno(errno);
+    }
+
+    *sent_len = (size_t)ret;
+    return __WASI_ESUCCESS;
 }
 
 __wasi_errno_t
@@ -2794,34 +3080,22 @@ wasmtime_ssp_sock_shutdown(
 #if !defined(WASMTIME_SSP_STATIC_CURFDS)
     struct fd_table *curfds,
 #endif
-    __wasi_fd_t sock, __wasi_sdflags_t how)
+    __wasi_fd_t sock)
 {
-    int nhow;
-    switch (how) {
-        case __WASI_SHUT_RD:
-            nhow = SHUT_RD;
-            break;
-        case __WASI_SHUT_WR:
-            nhow = SHUT_WR;
-            break;
-        case __WASI_SHUT_RD | __WASI_SHUT_WR:
-            nhow = SHUT_RDWR;
-            break;
-        default:
-            return __WASI_EINVAL;
-    }
-
     struct fd_object *fo;
-    __wasi_errno_t error =
-        fd_object_get(curfds, &fo, sock, __WASI_RIGHT_SOCK_SHUTDOWN, 0);
+    __wasi_errno_t error;
+    int ret;
+
+    error = fd_object_get(curfds, &fo, sock, 0, 0);
     if (error != 0)
         return error;
 
-    int ret = shutdown(fd_number(fo), nhow);
+    ret = os_socket_shutdown(fd_number(fo));
     fd_object_release(fo);
-    if (ret < 0)
+    if (BHT_OK != ret)
         return convert_errno(errno);
-    return 0;
+
+    return __WASI_ESUCCESS;
 }
 
 __wasi_errno_t
@@ -2940,5 +3214,102 @@ fd_prestats_destroy(struct fd_prestats *pt)
         }
         rwlock_destroy(&pt->lock);
         wasm_runtime_free(pt->prestats);
+    }
+}
+
+bool
+addr_pool_init(struct addr_pool *addr_pool)
+{
+    addr_pool->next = NULL;
+    addr_pool->addr = 0;
+    addr_pool->mask = 0;
+    return true;
+}
+
+bool
+addr_pool_insert(struct addr_pool *addr_pool, const char *addr, uint8 mask)
+{
+    struct addr_pool *cur = addr_pool;
+    struct addr_pool *next;
+
+    if (!addr_pool) {
+        return false;
+    }
+
+    if (!(next = wasm_runtime_malloc(sizeof(struct addr_pool)))) {
+        return false;
+    }
+
+    next->next = NULL;
+    next->mask = mask;
+    if (os_socket_inet_network(addr, &next->addr) != BHT_OK) {
+        wasm_runtime_free(next);
+        return false;
+    }
+
+    /* attach with */
+    while (cur->next) {
+        cur = cur->next;
+    }
+    cur->next = next;
+    return true;
+}
+
+static bool
+compare_address(const struct addr_pool *addr_pool_entry, const char *addr)
+{
+    /* host order */
+    uint32 target;
+    uint32 address = addr_pool_entry->addr;
+    /* 0.0.0.0 means any address */
+    if (0 == address) {
+        return true;
+    }
+
+    if (os_socket_inet_network(addr, &target) != BHT_OK) {
+        return false;
+    }
+
+    const uint32 max_mask_value = 32;
+    /* no support for invalid mask values */
+    if (addr_pool_entry->mask > max_mask_value) {
+        return false;
+    }
+
+    /* convert mask number into 32-bit mask value, i.e. mask /24 will be
+    converted to 4294967040 (binary: 11111111 11111111 11111111 00000000) */
+    uint32 mask = 0;
+    for (int i = 0; i < addr_pool_entry->mask; i++) {
+        mask |= 1 << (max_mask_value - 1 - i);
+    }
+
+    uint32 first_address = address & mask;
+    uint32 last_address = address | (~mask);
+    return first_address <= target && target <= last_address;
+}
+
+bool
+addr_pool_search(struct addr_pool *addr_pool, const char *addr)
+{
+    struct addr_pool *cur = addr_pool->next;
+
+    while (cur) {
+        if (compare_address(cur, addr))
+            return true;
+        cur = cur->next;
+    }
+
+    return false;
+}
+
+void
+addr_pool_destroy(struct addr_pool *addr_pool)
+{
+    struct addr_pool *cur = addr_pool->next;
+
+    while (cur) {
+        struct addr_pool *next = cur->next;
+        wasm_runtime_free(cur);
+        cur = next;
     }
 }

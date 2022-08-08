@@ -18,6 +18,8 @@ typedef int64 CellType_I64;
 typedef float32 CellType_F32;
 typedef float64 CellType_F64;
 
+#if !defined(OS_ENABLE_HW_BOUND_CHECK) \
+    || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0
 #define CHECK_MEMORY_OVERFLOW(bytes)                             \
     do {                                                         \
         uint64 offset1 = (uint64)offset + (uint64)addr;          \
@@ -39,6 +41,19 @@ typedef float64 CellType_F64;
         else                                            \
             goto out_of_bounds;                         \
     } while (0)
+#else
+#define CHECK_MEMORY_OVERFLOW(bytes)                    \
+    do {                                                \
+        uint64 offset1 = (uint64)offset + (uint64)addr; \
+        maddr = memory->memory_data + offset1;          \
+    } while (0)
+
+#define CHECK_BULK_MEMORY_OVERFLOW(start, bytes, maddr) \
+    do {                                                \
+        maddr = memory->memory_data + (uint32)(start);  \
+    } while (0)
+#endif /* !defined(OS_ENABLE_HW_BOUND_CHECK) \
+          || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 */
 
 #define CHECK_ATOMIC_MEMORY_ACCESS(align)          \
     do {                                           \
@@ -764,7 +779,7 @@ static inline int64
 sign_ext_8_64(int8 val)
 {
     if (val & 0x80)
-        return (int64)val | (int64)0xffffffffffffff00;
+        return (int64)val | (int64)0xffffffffffffff00LL;
     return val;
 }
 
@@ -772,7 +787,7 @@ static inline int64
 sign_ext_16_64(int16 val)
 {
     if (val & 0x8000)
-        return (int64)val | (int64)0xffffffffffff0000;
+        return (int64)val | (int64)0xffffffffffff0000LL;
     return val;
 }
 
@@ -780,15 +795,22 @@ static inline int64
 sign_ext_32_64(int32 val)
 {
     if (val & (int32)0x80000000)
-        return (int64)val | (int64)0xffffffff00000000;
+        return (int64)val | (int64)0xffffffff00000000LL;
     return val;
 }
 
 static inline void
 word_copy(uint32 *dest, uint32 *src, unsigned num)
 {
-    for (; num > 0; num--)
-        *dest++ = *src++;
+    bh_assert(dest != NULL);
+    bh_assert(src != NULL);
+    bh_assert(num > 0);
+    if (dest != src) {
+        /* No overlap buffer */
+        bh_assert(!((src < dest) && (dest < src + num)));
+        for (; num > 0; num--)
+            *dest++ = *src++;
+    }
 }
 
 static inline WASMInterpFrame *
@@ -823,6 +845,26 @@ FREE_FRAME(WASMExecEnv *exec_env, WASMInterpFrame *frame)
     wasm_exec_env_free_wasm_frame(exec_env, frame);
 }
 
+void
+wasm_interp_restore_wasm_frame(WASMExecEnv *exec_env)
+{
+    WASMInterpFrame *cur_frame, *prev_frame;
+
+    cur_frame = wasm_exec_env_get_cur_frame(exec_env);
+    while (cur_frame) {
+        prev_frame = cur_frame->prev_frame;
+        if (cur_frame->ip) {
+            /* FREE_FRAME just set the wasm_stack.s.top pointer, we only need to
+             * call it once */
+            FREE_FRAME(exec_env, cur_frame);
+            break;
+        }
+        cur_frame = prev_frame;
+    }
+
+    wasm_exec_env_set_cur_frame(exec_env, cur_frame);
+}
+
 static void
 wasm_interp_call_func_native(WASMModuleInstance *module_inst,
                              WASMExecEnv *exec_env,
@@ -832,7 +874,8 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     WASMFunctionImport *func_import = cur_func->u.func_import;
     unsigned local_cell_num = 2;
     WASMInterpFrame *frame;
-    uint32 argv_ret[2];
+    uint32 argv_ret[2], cur_func_index;
+    void *native_func_pointer = NULL;
     bool ret;
 
     if (!(frame = ALLOC_FRAME(exec_env,
@@ -846,7 +889,11 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
 
     wasm_exec_env_set_cur_frame(exec_env, frame);
 
-    if (!func_import->func_ptr_linked) {
+    cur_func_index = (uint32)(cur_func - module_inst->functions);
+    bh_assert(cur_func_index < module_inst->module->import_function_count);
+    native_func_pointer = module_inst->import_func_ptrs[cur_func_index];
+
+    if (!native_func_pointer) {
         char buf[128];
         snprintf(buf, sizeof(buf),
                  "failed to call unlinked import function (%s, %s)",
@@ -857,9 +904,8 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
 
     if (func_import->call_conv_wasm_c_api) {
         ret = wasm_runtime_invoke_c_api_native(
-            (WASMModuleInstanceCommon *)module_inst,
-            func_import->func_ptr_linked, func_import->func_type,
-            cur_func->param_cell_num, frame->lp,
+            (WASMModuleInstanceCommon *)module_inst, native_func_pointer,
+            func_import->func_type, cur_func->param_cell_num, frame->lp,
             func_import->wasm_c_api_with_env, func_import->attachment);
         if (ret) {
             argv_ret[0] = frame->lp[0];
@@ -868,13 +914,13 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     }
     else if (!func_import->call_conv_raw) {
         ret = wasm_runtime_invoke_native(
-            exec_env, func_import->func_ptr_linked, func_import->func_type,
+            exec_env, native_func_pointer, func_import->func_type,
             func_import->signature, func_import->attachment, frame->lp,
             cur_func->param_cell_num, argv_ret);
     }
     else {
         ret = wasm_runtime_invoke_native_raw(
-            exec_env, func_import->func_ptr_linked, func_import->func_type,
+            exec_env, native_func_pointer, func_import->func_type,
             func_import->signature, func_import->attachment, frame->lp,
             cur_func->param_cell_num, argv_ret);
     }
@@ -912,6 +958,9 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
     WASMFunctionImport *func_import = cur_func->u.func_import;
     uint8 *ip = prev_frame->ip;
     char buf[128];
+    WASMExecEnv *sub_module_exec_env = NULL;
+    uint32 aux_stack_origin_boundary = 0;
+    uint32 aux_stack_origin_bottom = 0;
 
     if (!sub_func_inst) {
         snprintf(buf, sizeof(buf),
@@ -921,20 +970,38 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         return;
     }
 
+    /* Switch exec_env but keep using the same one by replacing necessary
+     * variables */
+    sub_module_exec_env = wasm_runtime_get_exec_env_singleton(
+        (WASMModuleInstanceCommon *)sub_module_inst);
+    if (!sub_module_exec_env) {
+        wasm_set_exception(module_inst, "create singleton exec_env failed");
+        return;
+    }
+
+    /* - module_inst */
+    exec_env->module_inst = (WASMModuleInstanceCommon *)sub_module_inst;
+    /* - aux_stack_boundary */
+    aux_stack_origin_boundary = exec_env->aux_stack_boundary.boundary;
+    exec_env->aux_stack_boundary.boundary =
+        sub_module_exec_env->aux_stack_boundary.boundary;
+    /* - aux_stack_bottom */
+    aux_stack_origin_bottom = exec_env->aux_stack_bottom.bottom;
+    exec_env->aux_stack_bottom.bottom =
+        sub_module_exec_env->aux_stack_bottom.bottom;
+
     /* set ip NULL to make call_func_bytecode return after executing
        this function */
     prev_frame->ip = NULL;
-
-    /* replace exec_env's module_inst with sub_module_inst so we can
-       call it */
-    exec_env->module_inst = (WASMModuleInstanceCommon *)sub_module_inst;
 
     /* call function of sub-module*/
     wasm_interp_call_func_bytecode(sub_module_inst, exec_env, sub_func_inst,
                                    prev_frame);
 
-    /* restore ip and module_inst */
+    /* restore ip and other replaced */
     prev_frame->ip = ip;
+    exec_env->aux_stack_boundary.boundary = aux_stack_origin_boundary;
+    exec_env->aux_stack_bottom.bottom = aux_stack_origin_bottom;
     exec_env->module_inst = (WASMModuleInstanceCommon *)module_inst;
 
     /* transfer exception if it is thrown */
@@ -1048,10 +1115,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMInterpFrame *prev_frame)
 {
     WASMMemoryInstance *memory = module->default_memory;
+#if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
+    || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
+    || WASM_ENABLE_BULK_MEMORY != 0
     uint32 num_bytes_per_page = memory ? memory->num_bytes_per_page : 0;
-    uint8 *global_data = module->global_data;
     uint32 linear_mem_size =
         memory ? num_bytes_per_page * memory->cur_page_count : 0;
+#endif
+    uint8 *global_data = module->global_data;
     WASMGlobalInstance *globals = module->globals, *global;
     uint8 opcode_IMPDEP = WASM_OP_IMPDEP;
     WASMInterpFrame *frame = NULL;
@@ -1765,11 +1836,42 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     frame_lp[addr_ret] = prev_page_count;
                     /* update memory instance ptr and memory size */
                     memory = module->default_memory;
+#if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
+    || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
+    || WASM_ENABLE_BULK_MEMORY != 0
                     linear_mem_size =
                         num_bytes_per_page * memory->cur_page_count;
+#endif
                 }
 
                 (void)reserved;
+                HANDLE_OP_END();
+            }
+
+            /* constant instructions */
+            HANDLE_OP(WASM_OP_F64_CONST)
+            HANDLE_OP(WASM_OP_I64_CONST)
+            {
+                uint8 *orig_ip = frame_ip;
+
+                frame_ip += sizeof(uint64);
+                addr_ret = GET_OFFSET();
+
+                bh_memcpy_s(frame_lp + addr_ret, sizeof(uint64), orig_ip,
+                            sizeof(uint64));
+                HANDLE_OP_END();
+            }
+
+            HANDLE_OP(WASM_OP_F32_CONST)
+            HANDLE_OP(WASM_OP_I32_CONST)
+            {
+                uint8 *orig_ip = frame_ip;
+
+                frame_ip += sizeof(uint32);
+                addr_ret = GET_OFFSET();
+
+                bh_memcpy_s(frame_lp + addr_ret, sizeof(uint32), orig_ip,
+                            sizeof(uint32));
                 HANDLE_OP_END();
             }
 
@@ -2843,7 +2945,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         offset = (uint64)POP_I32();
                         addr = POP_I32();
 
+#ifndef OS_ENABLE_HW_BOUND_CHECK
                         CHECK_BULK_MEMORY_OVERFLOW(addr, bytes, maddr);
+#else
+                        if ((uint64)(uint32)addr + bytes
+                            > (uint64)linear_mem_size)
+                            goto out_of_bounds;
+                        maddr = memory->memory_data + (uint32)addr;
+#endif
 
                         seg_len = (uint64)module->module->data_segments[segment]
                                       ->data_length;
@@ -2862,7 +2971,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         segment = read_uint32(frame_ip);
 
                         module->module->data_segments[segment]->data_length = 0;
-
                         break;
                     }
                     case WASM_OP_MEMORY_COPY:
@@ -2874,12 +2982,21 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         src = POP_I32();
                         dst = POP_I32();
 
+#ifndef OS_ENABLE_HW_BOUND_CHECK
                         CHECK_BULK_MEMORY_OVERFLOW(src, len, msrc);
                         CHECK_BULK_MEMORY_OVERFLOW(dst, len, mdst);
+#else
+                        if ((uint64)(uint32)src + len > (uint64)linear_mem_size)
+                            goto out_of_bounds;
+                        msrc = memory->memory_data + (uint32)src;
+
+                        if ((uint64)(uint32)dst + len > (uint64)linear_mem_size)
+                            goto out_of_bounds;
+                        mdst = memory->memory_data + (uint32)dst;
+#endif
 
                         /* allowing the destination and source to overlap */
                         bh_memmove_s(mdst, linear_mem_size - dst, msrc, len);
-
                         break;
                     }
                     case WASM_OP_MEMORY_FILL:
@@ -2891,10 +3008,15 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         fill_val = POP_I32();
                         dst = POP_I32();
 
+#ifndef OS_ENABLE_HW_BOUND_CHECK
                         CHECK_BULK_MEMORY_OVERFLOW(dst, len, mdst);
+#else
+                        if ((uint64)(uint32)dst + len > (uint64)linear_mem_size)
+                            goto out_of_bounds;
+                        mdst = memory->memory_data + (uint32)dst;
+#endif
 
                         memset(mdst, fill_val, len);
-
                         break;
                     }
 #endif /* WASM_ENABLE_BULK_MEMORY */
@@ -2984,8 +3106,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         s = (uint32)POP_I32();
                         d = (uint32)POP_I32();
 
-                        if (s + n > dst_tbl_inst->cur_size
-                            || d + n > src_tbl_inst->cur_size) {
+                        if (d + n > dst_tbl_inst->cur_size
+                            || s + n > src_tbl_inst->cur_size) {
                             wasm_set_exception(module,
                                                "out of bounds table access");
                             goto got_exception;
@@ -3308,6 +3430,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             CHECK_BULK_MEMORY_OVERFLOW(addr + offset, 1, maddr);
                             CHECK_ATOMIC_MEMORY_ACCESS(1);
 
+                            expect = (uint8)expect;
                             os_mutex_lock(&memory->mem_lock);
                             readv = (uint32)(*(uint8 *)maddr);
                             if (readv == expect)
@@ -3318,6 +3441,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             CHECK_BULK_MEMORY_OVERFLOW(addr + offset, 2, maddr);
                             CHECK_ATOMIC_MEMORY_ACCESS(2);
 
+                            expect = (uint16)expect;
                             os_mutex_lock(&memory->mem_lock);
                             readv = (uint32)LOAD_U16(maddr);
                             if (readv == expect)
@@ -3352,6 +3476,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             CHECK_BULK_MEMORY_OVERFLOW(addr + offset, 1, maddr);
                             CHECK_ATOMIC_MEMORY_ACCESS(1);
 
+                            expect = (uint8)expect;
                             os_mutex_lock(&memory->mem_lock);
                             readv = (uint64)(*(uint8 *)maddr);
                             if (readv == expect)
@@ -3362,6 +3487,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             CHECK_BULK_MEMORY_OVERFLOW(addr + offset, 2, maddr);
                             CHECK_ATOMIC_MEMORY_ACCESS(2);
 
+                            expect = (uint16)expect;
                             os_mutex_lock(&memory->mem_lock);
                             readv = (uint64)LOAD_U16(maddr);
                             if (readv == expect)
@@ -3372,6 +3498,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             CHECK_BULK_MEMORY_OVERFLOW(addr + offset, 4, maddr);
                             CHECK_ATOMIC_MEMORY_ACCESS(4);
 
+                            expect = (uint32)expect;
                             os_mutex_lock(&memory->mem_lock);
                             readv = (uint64)LOAD_U32(maddr);
                             if (readv == expect)
@@ -3491,10 +3618,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         HANDLE_OP(WASM_OP_F64_LOAD)
         HANDLE_OP(EXT_OP_GET_LOCAL_FAST)
         HANDLE_OP(WASM_OP_GET_LOCAL)
-        HANDLE_OP(WASM_OP_F64_CONST)
-        HANDLE_OP(WASM_OP_I64_CONST)
-        HANDLE_OP(WASM_OP_F32_CONST)
-        HANDLE_OP(WASM_OP_I32_CONST)
         HANDLE_OP(WASM_OP_DROP)
         HANDLE_OP(WASM_OP_DROP_64)
         HANDLE_OP(WASM_OP_BLOCK)
@@ -3504,6 +3627,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         HANDLE_OP(EXT_OP_BLOCK)
         HANDLE_OP(EXT_OP_LOOP)
         HANDLE_OP(EXT_OP_IF)
+        HANDLE_OP(EXT_OP_BR_TABLE_CACHE)
         {
             wasm_set_exception(module, "unsupported opcode");
             goto got_exception;
@@ -3543,7 +3667,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             }
         }
         frame->lp = frame->operand + cur_func->const_cell_num;
-        word_copy(frame->lp, lp_base, lp - lp_base);
+        if (lp - lp_base > 0) {
+            word_copy(frame->lp, lp_base, lp - lp_base);
+        }
         wasm_runtime_free(lp_base);
         FREE_FRAME(exec_env, frame);
         frame_ip += cur_func->param_count * sizeof(int16);
@@ -3570,6 +3696,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         {
             outs_area->lp = outs_area->operand + cur_func->const_cell_num;
         }
+
+        if ((uint8 *)(outs_area->lp + cur_func->param_cell_num)
+            > exec_env->wasm_stack.s.top_boundary) {
+            wasm_set_exception(module, "wasm operand stack overflow");
+            goto got_exception;
+        }
+
         for (i = 0; i < cur_func->param_count; i++) {
             if (cur_func->param_types[i] == VALUE_TYPE_I64
                 || cur_func->param_types[i] == VALUE_TYPE_F64) {
@@ -3624,8 +3757,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             /* update memory instance ptr and memory size */
             memory = module->default_memory;
+#if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
+    || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
+    || WASM_ENABLE_BULK_MEMORY != 0
             if (memory)
                 linear_mem_size = num_bytes_per_page * memory->cur_page_count;
+#endif
             if (wasm_get_exception(module))
                 goto got_exception;
         }
@@ -3656,8 +3793,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame->operand + cur_wasm_func->const_cell_num;
 
             /* Initialize the consts */
-            word_copy(frame->operand, (uint32 *)cur_wasm_func->consts,
-                      cur_wasm_func->const_cell_num);
+            if (cur_wasm_func->const_cell_num > 0) {
+                word_copy(frame->operand, (uint32 *)cur_wasm_func->consts,
+                          cur_wasm_func->const_cell_num);
+            }
 
             /* Initialize the local variables */
             memset(frame_lp + cur_func->param_cell_num, 0,
@@ -3689,8 +3828,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         goto got_exception;
 #endif
 
+#if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
+    || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
+    || WASM_ENABLE_BULK_MEMORY != 0
     out_of_bounds:
         wasm_set_exception(module, "out of bounds memory access");
+#endif
 
     got_exception:
         SYNC_ALL_TO_FRAME();
@@ -3733,18 +3876,21 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
     if (argc < function->param_cell_num) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-                 "invalid argument count %u, must be no smaller than %u", argc,
-                 function->param_cell_num);
+                 "invalid argument count %" PRIu32
+                 ", must be no smaller than %" PRIu32,
+                 argc, (uint32)function->param_cell_num);
         wasm_set_exception(module_inst, buf);
         return;
     }
     argc = function->param_cell_num;
 
+#ifndef OS_ENABLE_HW_BOUND_CHECK
     if ((uint8 *)&prev_frame < exec_env->native_stack_boundary) {
         wasm_set_exception((WASMModuleInstance *)exec_env->module_inst,
                            "native stack overflow");
         return;
     }
+#endif
 
     if (!(frame =
               ALLOC_FRAME(exec_env, frame_size, (WASMInterpFrame *)prev_frame)))
@@ -3756,6 +3902,13 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
     /* There is no local variable. */
     frame->lp = frame->operand + 0;
     frame->ret_offset = 0;
+
+    if ((uint8 *)(outs_area->operand + function->const_cell_num + argc)
+        > exec_env->wasm_stack.s.top_boundary) {
+        wasm_set_exception((WASMModuleInstance *)exec_env->module_inst,
+                           "wasm operand stack overflow");
+        return;
+    }
 
     if (argc > 0)
         word_copy(outs_area->operand + function->const_cell_num, argv, argc);
@@ -3788,8 +3941,11 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
     }
     else {
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
-        wasm_interp_dump_call_stack(exec_env);
+        if (wasm_interp_create_call_stack(exec_env)) {
+            wasm_interp_dump_call_stack(exec_env, true, NULL, 0);
+        }
 #endif
+        LOG_DEBUG("meet an exception %s", wasm_get_exception(module_inst));
     }
 
     wasm_exec_env_set_cur_frame(exec_env, prev_frame);

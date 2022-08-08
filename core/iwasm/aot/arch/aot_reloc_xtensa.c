@@ -22,6 +22,26 @@ void __modsi3();
 
 void __divdi3();
 
+void __udivdi3();
+void __unorddf2();
+void __adddf3();
+void __eqdf2();
+void __muldf3();
+void __gedf2();
+void __ledf2();
+void __fixunsdfsi();
+void __floatunsidf();
+void __subdf3();
+void __nedf2();
+void __fixdfsi();
+void __moddi3();
+void __extendsfdf2();
+void __truncdfsf2();
+void __gtdf2();
+void __umoddi3();
+void __floatdidf();
+void __divsf3();
+
 static SymbolMap target_sym_map[] = {
     REG_COMMON_SYMBOLS
 
@@ -40,6 +60,28 @@ static SymbolMap target_sym_map[] = {
 
     REG_SYM(__modsi3),
     REG_SYM(__divdi3),
+
+    REG_SYM(__udivdi3),
+    REG_SYM(__unorddf2),
+    REG_SYM(__adddf3),
+    REG_SYM(__eqdf2),
+    REG_SYM(__muldf3),
+    REG_SYM(__gedf2),
+    REG_SYM(__ledf2),
+    REG_SYM(__fixunsdfsi),
+    REG_SYM(__floatunsidf),
+    REG_SYM(__subdf3),
+    REG_SYM(__nedf2),
+    REG_SYM(__fixdfsi),
+    REG_SYM(__moddi3),
+    REG_SYM(__extendsfdf2),
+    REG_SYM(__truncdfsf2),
+    REG_SYM(__gtdf2),
+    REG_SYM(__umoddi3),
+    REG_SYM(__floatdidf),
+    REG_SYM(__divsf3),
+    REG_SYM(sqrt),
+    REG_SYM(sqrtf),
 };
 /* clang-format on */
 
@@ -112,7 +154,7 @@ put_imm16_to_addr(int16 imm16, int16 *addr)
     if ((intptr_t)addr % 4 != 3) {
         *(int32 *)bytes = *addr_aligned1;
         *(int16 *)(bytes + ((intptr_t)addr % 4)) = imm16;
-        memcpy(addr_aligned1, bytes, 4);
+        *addr_aligned1 = *(int32 *)bytes;
     }
     else {
         addr_aligned2 = (int32 *)(((intptr_t)addr + 3) & ~3);
@@ -129,6 +171,16 @@ static union {
 } __ue = { .a = 1 };
 
 #define is_little_endian() (__ue.b == 1)
+
+#if !defined(__packed)
+/*
+ * Note: This version check is a bit relaxed.
+ * The __packed__ attribute has been there since gcc 2 era.
+ */
+#if __GNUC__ >= 3
+#define __packed __attribute__((__packed__))
+#endif
+#endif
 
 typedef union {
     struct l32r_le {

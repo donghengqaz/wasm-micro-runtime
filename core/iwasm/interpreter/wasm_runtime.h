@@ -40,11 +40,6 @@ struct WASMMemoryInstance {
     /* The heap created */
     void *heap_handle;
 
-#if WASM_ENABLE_MULTI_MODULE != 0
-    /* to indicate which module instance create it */
-    WASMModuleInstance *owner;
-#endif
-
 #if WASM_ENABLE_SHARED_MEMORY != 0
     /* mutex lock for the memory, used in atomic operation */
     korp_mutex mem_lock;
@@ -57,6 +52,22 @@ struct WASMMemoryInstance {
        Note: when memory is re-allocated, the heap data and memory data
              must be copied to new memory also. */
     uint8 *memory_data;
+
+#if WASM_ENABLE_FAST_JIT != 0
+#if UINTPTR_MAX == UINT64_MAX
+    uint64 mem_bound_check_1byte;
+    uint64 mem_bound_check_2bytes;
+    uint64 mem_bound_check_4bytes;
+    uint64 mem_bound_check_8bytes;
+    uint64 mem_bound_check_16bytes;
+#else
+    uint32 mem_bound_check_1byte;
+    uint32 mem_bound_check_2bytes;
+    uint32 mem_bound_check_4bytes;
+    uint32 mem_bound_check_8bytes;
+    uint32 mem_bound_check_16bytes;
+#endif
+#endif
 };
 
 struct WASMTableInstance {
@@ -170,6 +181,13 @@ struct WASMModuleInstance {
     uint32 export_tab_count;
 #endif
 
+    /* Array of function pointers to import functions */
+    void **import_func_ptrs;
+#if WASM_ENABLE_FAST_JIT != 0
+    /* point to JITed functions */
+    void **fast_jit_func_ptrs;
+#endif
+
     WASMMemoryInstance **memories;
     WASMTableInstance **tables;
     WASMGlobalInstance *globals;
@@ -278,12 +296,11 @@ wasm_get_func_code_end(WASMFunctionInstance *func)
 }
 
 WASMModule *
-wasm_load(const uint8 *buf, uint32 size, char *error_buf,
-          uint32 error_buf_size);
+wasm_load(uint8 *buf, uint32 size, char *error_buf, uint32 error_buf_size);
 
 WASMModule *
 wasm_load_from_sections(WASMSection *section_list, char *error_buf,
-                        uint32_t error_buf_size);
+                        uint32 error_buf_size);
 
 void
 wasm_unload(WASMModule *module);
@@ -369,16 +386,22 @@ wasm_get_app_addr_range(WASMModuleInstance *module_inst, uint32 app_offset,
                         uint32 *p_app_start_offset, uint32 *p_app_end_offset);
 
 bool
-wasm_get_native_addr_range(WASMModuleInstance *module_inst, uint8_t *native_ptr,
-                           uint8_t **p_native_start_addr,
-                           uint8_t **p_native_end_addr);
+wasm_get_native_addr_range(WASMModuleInstance *module_inst, uint8 *native_ptr,
+                           uint8 **p_native_start_addr,
+                           uint8 **p_native_end_addr);
 
 bool
 wasm_enlarge_memory(WASMModuleInstance *module, uint32 inc_page_count);
 
 bool
-wasm_call_indirect(WASMExecEnv *exec_env, uint32_t tbl_idx,
-                   uint32_t element_indices, uint32_t argc, uint32_t argv[]);
+wasm_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 elem_idx,
+                   uint32 argc, uint32 argv[]);
+
+#if WASM_ENABLE_FAST_JIT != 0
+bool
+jit_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 elem_idx,
+                  uint32 type_idx, uint32 argc, uint32 argv[]);
+#endif
 
 #if WASM_ENABLE_THREAD_MGR != 0
 bool
@@ -386,6 +409,16 @@ wasm_set_aux_stack(WASMExecEnv *exec_env, uint32 start_offset, uint32 size);
 
 bool
 wasm_get_aux_stack(WASMExecEnv *exec_env, uint32 *start_offset, uint32 *size);
+#endif
+
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+#ifndef BH_PLATFORM_WINDOWS
+void
+wasm_signal_handler(WASMSignalInfo *sig_info);
+#else
+LONG
+wasm_exception_handler(WASMSignalInfo *sig_info);
+#endif
 #endif
 
 void
@@ -435,9 +468,30 @@ wasm_get_table_inst(const WASMModuleInstance *module_inst, const uint32 tbl_idx)
 }
 
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
-void
-wasm_interp_dump_call_stack(struct WASMExecEnv *exec_env);
+bool
+wasm_interp_create_call_stack(struct WASMExecEnv *exec_env);
+
+/**
+ * @brief Dump wasm call stack or get the size
+ *
+ * @param exec_env the execution environment
+ * @param print whether to print to stdout or not
+ * @param buf buffer to store the dumped content
+ * @param len length of the buffer
+ *
+ * @return when print is true, return the bytes printed out to stdout; when
+ * print is false and buf is NULL, return the size required to store the
+ * callstack content; when print is false and buf is not NULL, return the size
+ * dumped to the buffer, 0 means error and data in buf may be invalid
+ */
+uint32
+wasm_interp_dump_call_stack(struct WASMExecEnv *exec_env, bool print, char *buf,
+                            uint32 len);
 #endif
+
+const uint8 *
+wasm_loader_get_custom_section(WASMModule *module, const char *name,
+                               uint32 *len);
 
 #ifdef __cplusplus
 }

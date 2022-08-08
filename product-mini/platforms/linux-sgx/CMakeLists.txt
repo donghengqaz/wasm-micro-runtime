@@ -16,9 +16,11 @@ if (NOT DEFINED WAMR_BUILD_TARGET)
   if (CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Build as X86_64 by default in 64-bit platform
     set (WAMR_BUILD_TARGET "X86_64")
-  else ()
+  elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Build as X86_32 by default in 32-bit platform
     set (WAMR_BUILD_TARGET "X86_32")
+  else ()
+    message(SEND_ERROR "Unsupported build target platform!")
   endif ()
 endif ()
 
@@ -40,6 +42,11 @@ endif ()
 if (NOT DEFINED WAMR_BUILD_JIT)
   # Disable JIT by default.
   set (WAMR_BUILD_JIT 0)
+endif ()
+
+if (NOT DEFINED WAMR_BUILD_FAST_JIT)
+  # Disable Fast JIT by default
+  set (WAMR_BUILD_FAST_JIT 0)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_LIBC_BUILTIN)

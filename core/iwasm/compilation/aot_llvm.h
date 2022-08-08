@@ -14,17 +14,21 @@
 #include "llvm-c/Object.h"
 #include "llvm-c/ExecutionEngine.h"
 #include "llvm-c/Analysis.h"
+#include "llvm-c/BitWriter.h"
 #include "llvm-c/Transforms/Utils.h"
 #include "llvm-c/Transforms/Scalar.h"
 #include "llvm-c/Transforms/Vectorize.h"
 #include "llvm-c/Transforms/PassManagerBuilder.h"
 
 #if WASM_ENABLE_LAZY_JIT != 0
-#include "aot_llvm_lazyjit.h"
 #include "llvm-c/Orc.h"
 #include "llvm-c/Error.h"
-#include "llvm-c/Initialization.h"
 #include "llvm-c/Support.h"
+#include "llvm-c/Initialization.h"
+#include "llvm-c/TargetMachine.h"
+#if LLVM_VERSION_MAJOR >= 12
+#include "llvm-c/LLJIT.h"
+#endif
 #endif
 #if WASM_ENABLE_DEBUG_AOT != 0
 #include "llvm-c/DebugInfo.h"
@@ -32,6 +36,20 @@
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#if LLVM_VERSION_MAJOR < 14
+#define LLVMBuildLoad2(builder, type, value, name) \
+    LLVMBuildLoad(builder, value, name)
+
+#define LLVMBuildCall2(builder, type, func, args, num_args, name) \
+    LLVMBuildCall(builder, func, args, num_args, name)
+
+#define LLVMBuildInBoundsGEP2(builder, type, ptr, indices, num_indices, name) \
+    LLVMBuildInBoundsGEP(builder, ptr, indices, num_indices, name)
+#else
+/* Opaque pointer type */
+#define OPQ_PTR_TYPE INT8_PTR_TYPE
 #endif
 
 /**
@@ -128,6 +146,9 @@ typedef struct AOTFuncContext {
     AOTFunc *aot_func;
     LLVMValueRef func;
     LLVMTypeRef func_type;
+    /* LLVM module for this function, note that in LAZY JIT mode,
+       each aot function belongs to an individual module */
+    LLVMModuleRef module;
     AOTBlockStack block_stack;
 
     LLVMValueRef exec_env;
@@ -249,7 +270,12 @@ typedef struct AOTCompContext {
 
     /* LLVM variables required to emit LLVM IR */
     LLVMContextRef context;
+#if WASM_ENABLE_LAZY_JIT == 0
+    /* Create one module only for non LAZY JIT mode,
+       for LAZY JIT mode, modules are created, each
+       aot function has its own module */
     LLVMModuleRef module;
+#endif
     LLVMBuilderRef builder;
 #if WASM_ENABLE_DEBUG_AOT
     LLVMDIBuilderRef debug_builder;
@@ -266,12 +292,18 @@ typedef struct AOTCompContext {
 
     /* LLVM execution engine required by JIT */
 #if WASM_ENABLE_LAZY_JIT != 0
-    LLVMOrcLLLazyJITRef lazy_orcjit;
-    LLVMOrcThreadSafeContextRef ts_context;
-    LLVMOrcJITTargetMachineBuilderRef tm_builder;
+    LLVMOrcLLJITRef orc_lazyjit;
+    LLVMOrcMaterializationUnitRef orc_material_unit;
+    LLVMOrcLazyCallThroughManagerRef orc_call_through_mgr;
+    LLVMOrcIndirectStubsManagerRef orc_indirect_stub_mgr;
+    LLVMOrcCSymbolAliasMapPairs orc_symbol_map_pairs;
+    LLVMOrcThreadSafeContextRef orc_thread_safe_context;
+    /* Each aot function has its own module */
+    LLVMModuleRef *modules;
 #else
     LLVMExecutionEngineRef exec_engine;
 #endif
+
     bool is_jit_mode;
 
     /* AOT indirect mode flag & symbol list */
@@ -314,9 +346,6 @@ typedef struct AOTCompContext {
     uint32 opt_level;
     uint32 size_level;
 
-    /* LLVM pass manager to optimize the JITed code */
-    LLVMPassManagerRef pass_mgr;
-
     /* LLVM floating-point rounding mode metadata */
     LLVMValueRef fp_rounding_mode;
 
@@ -334,6 +363,22 @@ typedef struct AOTCompContext {
     /* Function contexts */
     AOTFuncContext **func_ctxes;
     uint32 func_ctx_count;
+    char **custom_sections_wp;
+    uint32 custom_sections_count;
+
+    /* 3rd-party toolchains */
+    /* External llc compiler, if specified, wamrc will emit the llvm-ir file and
+     * invoke the llc compiler to generate object file.
+     * This can be used when we want to benefit from the optimization of other
+     * LLVM based toolchains */
+    const char *external_llc_compiler;
+    const char *llc_compiler_flags;
+    /* External asm compiler, if specified, wamrc will emit the text-based
+     * assembly file (.s) and invoke the llc compiler to generate object file.
+     * This will be useful when the upstream LLVM doesn't support to emit object
+     * file for some architecture (such as arc) */
+    const char *external_asm_compiler;
+    const char *asm_compiler_flags;
 } AOTCompContext;
 
 enum {
@@ -364,6 +409,8 @@ typedef struct AOTCompOption {
     uint32 size_level;
     uint32 output_format;
     uint32 bounds_checks;
+    char **custom_sections;
+    uint32 custom_sections_count;
 } AOTCompOption, *aot_comp_option_t;
 
 AOTCompContext *
@@ -442,16 +489,36 @@ LLVMValueRef
 aot_get_func_from_table(const AOTCompContext *comp_ctx, LLVMValueRef base,
                         LLVMTypeRef func_type, int32 index);
 
+LLVMValueRef
+aot_load_const_from_table(AOTCompContext *comp_ctx, LLVMValueRef base,
+                          const WASMValue *value, uint8 value_type);
+
 bool
 aot_check_simd_compatibility(const char *arch_c_str, const char *cpu_c_str);
 
 void
 aot_add_expand_memory_op_pass(LLVMPassManagerRef pass);
 
-#if WASM_ENABLE_LAZY_JIT != 0
 void
-aot_handle_llvm_errmsg(char *error_buf, uint32 error_buf_size,
-                       const char *string, LLVMErrorRef error);
+aot_add_simple_loop_unswitch_pass(LLVMPassManagerRef pass);
+
+void
+aot_apply_llvm_new_pass_manager(AOTCompContext *comp_ctx);
+
+#if WASM_ENABLE_LAZY_JIT != 0
+LLVMOrcJITTargetMachineBuilderRef
+LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(LLVMTargetMachineRef TM);
+
+void
+LLVMOrcLLJITBuilderSetNumCompileThreads(LLVMOrcLLJITBuilderRef orcjit_builder,
+                                        unsigned num_compile_threads);
+
+void
+aot_handle_llvm_errmsg(const char *string, LLVMErrorRef err);
+
+void *
+aot_lookup_orcjit_func(LLVMOrcLLJITRef orc_lazyjit, void *module_inst,
+                       uint32 func_idx);
 #endif
 
 #ifdef __cplusplus

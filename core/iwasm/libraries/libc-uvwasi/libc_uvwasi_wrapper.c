@@ -112,7 +112,6 @@ wasi_args_get(wasm_exec_env_t exec_env, uint32 *argv_offsets, char *argv_buf)
 
     for (i = 0; i < argc; i++)
         argv_offsets[i] = addr_native_to_app(argv[i]);
-    argv_offsets[argc] = 0;
 
     wasm_runtime_free(argv);
     return 0;
@@ -187,6 +186,9 @@ wasi_environ_get(wasm_exec_env_t exec_env, uint32 *environ_offsets,
     if (err)
         return err;
 
+    if (environ_count == 0)
+        return 0;
+
     total_size = sizeof(int32) * ((uint64)environ_count + 1);
     if (total_size >= UINT32_MAX
         || !validate_native_addr(environ_offsets, (uint32)total_size)
@@ -208,7 +210,6 @@ wasi_environ_get(wasm_exec_env_t exec_env, uint32 *environ_offsets,
 
     for (i = 0; i < environ_count; i++)
         environ_offsets[i] = addr_native_to_app(environs[i]);
-    environ_offsets[environ_count] = 0;
 
     wasm_runtime_free(environs);
     return 0;

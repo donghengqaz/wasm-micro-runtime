@@ -18,16 +18,18 @@ set (CMAKE_C_STANDARD 99)
 # "X86_64", "AMD_64", "X86_32", "AARCH64[sub]", "ARM[sub]", "THUMB[sub]",
 # "MIPS", "XTENSA", "RISCV64[sub]", "RISCV32[sub]"
 if (NOT DEFINED WAMR_BUILD_TARGET)
-  if (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)")
     set (WAMR_BUILD_TARGET "AARCH64")
   elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
     set (WAMR_BUILD_TARGET "RISCV64")
   elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
     # Build as X86_64 by default in 64-bit platform
     set (WAMR_BUILD_TARGET "X86_64")
-  else ()
+  elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
     # Build as X86_32 by default in 32-bit platform
     set (WAMR_BUILD_TARGET "X86_32")
+  else ()
+    message(SEND_ERROR "Unsupported build target platform!")
   endif ()
 endif ()
 
@@ -48,6 +50,11 @@ endif ()
 if (NOT DEFINED WAMR_BUILD_JIT)
   # Disable JIT by default.
   set (WAMR_BUILD_JIT 0)
+endif ()
+
+if (NOT DEFINED WAMR_BUILD_FAST_JIT)
+  # Disable Fast JIT by default
+  set (WAMR_BUILD_FAST_JIT 0)
 endif ()
 
 if (NOT DEFINED WAMR_BUILD_LIBC_BUILTIN)
@@ -115,14 +122,20 @@ set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections -pie -f
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wformat -Wformat-security -Wshadow")
 # set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wconversion -Wsign-conversion")
 
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wformat -Wformat-security")
+
 if (WAMR_BUILD_TARGET MATCHES "X86_.*" OR WAMR_BUILD_TARGET STREQUAL "AMD_64")
   if (NOT (CMAKE_C_COMPILER MATCHES ".*clang.*" OR CMAKE_C_COMPILER_ID MATCHES ".*Clang"))
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mindirect-branch-register")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mindirect-branch-register")
     # UNDEFINED BEHAVIOR, refer to https://en.cppreference.com/w/cpp/language/ub
     if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT WAMR_BUILD_JIT EQUAL 1)
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined \
                                           -fno-sanitize=bounds,bounds-strict,alignment \
                                           -fno-sanitize-recover")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined \
+                                              -fno-sanitize=bounds,bounds-strict,alignment \
+                                              -fno-sanitize-recover")
     endif()
   else ()
     # UNDEFINED BEHAVIOR, refer to https://en.cppreference.com/w/cpp/language/ub
@@ -130,6 +143,9 @@ if (WAMR_BUILD_TARGET MATCHES "X86_.*" OR WAMR_BUILD_TARGET STREQUAL "AMD_64")
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined \
                                           -fno-sanitize=bounds,alignment \
                                           -fno-sanitize-recover")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined \
+                                              -fno-sanitize=bounds,alignment \
+                                              -fno-sanitize-recover")
     endif()
   endif ()
 endif ()

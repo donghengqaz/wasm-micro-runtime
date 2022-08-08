@@ -2,6 +2,8 @@
 
 WAMR supports source level debugging based on DWARF (normally used in C/C++/Rust), source map (normally used in AssemblyScript) is not supported.
 
+**The lldb's ability to debug wasm application is based on the patch [Add class WasmProcess for WebAssembly debugging](https://reviews.llvm.org/D78801). Thanks very much to the author @paolosev for such a great work!**
+
 ## Build wasm application with debug information
 To debug your application, you need to compile them with debug information. You can use `-g` option when compiling the source code if you are using wasi-sdk (also work for emcc and rustc):
 ``` bash
@@ -51,9 +53,9 @@ Then you can use lldb commands to debug your applications. Please refer to [lldb
 
 > Known issue: `step over` on some function may be treated as `step in`, it will be fixed later.
 
-## Debugging with AoT
+## Debugging with AOT
 
-> Note: AoT debugging is experimental and only a few debugging capabilities are supported.
+> Note: AOT debugging is experimental and only a few debugging capabilities are supported.
 
 1. Build lldb (assume you have already built llvm)
 ``` bash
@@ -78,7 +80,7 @@ cmake .. -DWAMR_BUILD_DEBUG_AOT=1
 make
 ```
 
-4. Compile wasm module to AoT module
+4. Compile wasm module to AOT module
 ``` bash
 wamrc -o test.aot test.wasm
 ```

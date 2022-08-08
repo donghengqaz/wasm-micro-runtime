@@ -15,7 +15,9 @@
 extern "C" {
 #endif
 
+#ifndef AOT_FUNC_PREFIX
 #define AOT_FUNC_PREFIX "aot_func#"
+#endif
 
 typedef InitializerExpression AOTInitExpr;
 typedef WASMType AOTFuncType;
@@ -96,6 +98,7 @@ typedef struct AOTMemInitData {
 typedef struct AOTImportTable {
     char *module_name;
     char *table_name;
+    uint32 elem_type;
     uint32 table_flags;
     uint32 table_init_size;
     uint32 table_max_size;
@@ -268,7 +271,7 @@ typedef struct AOTCompData {
 
 typedef struct AOTNativeSymbol {
     bh_list_link link;
-    const char *symbol;
+    char symbol[32];
     int32 index;
 } AOTNativeSymbol;
 

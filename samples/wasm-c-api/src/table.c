@@ -49,19 +49,21 @@ void check_table(wasm_table_t* table, int32_t i, bool expect_set) {
 }
 
 void check_call(wasm_func_t* func, int32_t arg1, int32_t arg2, int32_t expected) {
-  wasm_val_vec_t args, results;
-  wasm_val_vec_new(&args, 2, (wasm_val_t []){ WASM_I32_VAL(arg1), WASM_I32_VAL(arg2) });
-  wasm_val_vec_new(&results, 1, (wasm_val_t []){ WASM_INIT_VAL });
-  if (wasm_func_call(func, &args, &results) || results.data[0].of.i32 != expected) {
+  wasm_val_t vs[2] = { WASM_I32_VAL(arg1), WASM_I32_VAL(arg2) };
+  wasm_val_t r[1] = { WASM_INIT_VAL };
+  wasm_val_vec_t args = WASM_ARRAY_VEC(vs);
+  wasm_val_vec_t results = WASM_ARRAY_VEC(r);
+  if (wasm_func_call(func, &args, &results) || r[0].of.i32 != expected) {
     printf("> Error on result\n");
     exit(1);
   }
 }
 
 void check_trap(wasm_func_t* func, int32_t arg1, int32_t arg2) {
-  wasm_val_vec_t args, results;
-  wasm_val_vec_new(&args, 2, (wasm_val_t []){ WASM_I32_VAL(arg1), WASM_I32_VAL(arg2) });
-  wasm_val_vec_new(&results, 1, (wasm_val_t []){ WASM_INIT_VAL });
+  wasm_val_t vs[2] = { WASM_I32_VAL(arg1), WASM_I32_VAL(arg2) };
+  wasm_val_t r[1] = { WASM_INIT_VAL };
+  wasm_val_vec_t args = WASM_ARRAY_VEC(vs);
+  wasm_val_vec_t results = WASM_ARRAY_VEC(r);
   own wasm_trap_t* trap = wasm_func_call(func, &args, &results);
   if (! trap) {
     printf("> Error on result, expected trap\n");
@@ -88,9 +90,28 @@ int main(int argc, const char* argv[]) {
     printf("> Error loading module!\n");
     return 1;
   }
-  fseek(file, 0L, SEEK_END);
-  size_t file_size = ftell(file);
-  fseek(file, 0L, SEEK_SET);
+
+  int ret = fseek(file, 0L, SEEK_END);
+  if (ret == -1) {
+    printf("> Error loading module!\n");
+    fclose(file);
+    return 1;
+  }
+
+  long file_size = ftell(file);
+  if (file_size == -1) {
+    printf("> Error loading module!\n");
+    fclose(file);
+    return 1;
+  }
+
+  ret = fseek(file, 0L, SEEK_SET);
+  if (ret == -1) {
+    printf("> Error loading module!\n");
+    fclose(file);
+    return 1;
+  }
+
   wasm_byte_vec_t binary;
   wasm_byte_vec_new_uninitialized(&binary, file_size);
   if (fread(binary.data, file_size, 1, file) != 1) {
@@ -112,8 +133,9 @@ int main(int argc, const char* argv[]) {
 
   // Instantiate.
   printf("Instantiating module...\n");
-  own wasm_instance_t *instance =
-    wasm_instance_new(store, module, NULL, NULL);
+  wasm_extern_vec_t imports = WASM_EMPTY_VEC;
+  own wasm_instance_t* instance =
+    wasm_instance_new(store, module, &imports, NULL);
   if (!instance) {
     printf("> Error instantiating module!\n");
     return 1;
@@ -134,6 +156,7 @@ int main(int argc, const char* argv[]) {
   // Create external function.
   printf("Creating callback...\n");
   own wasm_functype_t* neg_type = wasm_functype_new_1_1(wasm_valtype_new_i32(), wasm_valtype_new_i32());
+  own wasm_func_t* h = wasm_func_new(store, neg_type, neg_callback);
 
   wasm_functype_delete(neg_type);
 
@@ -155,7 +178,9 @@ int main(int argc, const char* argv[]) {
   printf("Mutating table...\n");
   check(wasm_table_set(table, 0, wasm_func_as_ref(g)));
   check(wasm_table_set(table, 1, NULL));
-  check(! wasm_table_set(table, 2, wasm_func_as_ref(f)));
+  wasm_ref_t *ref_f = wasm_func_as_ref(f);
+  check(! wasm_table_set(table, 2, ref_f));
+  wasm_ref_delete(ref_f);
   check_table(table, 0, true);
   check_table(table, 1, false);
   check_call(call_indirect, 7, 0, 666);
@@ -165,6 +190,8 @@ int main(int argc, const char* argv[]) {
   // Grow table.
   // DO NOT SUPPORT
   printf("Bypass Growing table...\n");
+
+  wasm_func_delete(h);
   wasm_extern_vec_delete(&exports);
   wasm_instance_delete(instance);
 

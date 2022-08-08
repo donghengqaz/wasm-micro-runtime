@@ -10,6 +10,11 @@
 #include "wasm_opcode.h"
 #include "wasm_runtime.h"
 #include "../common/wasm_native.h"
+#include "../common/wasm_memory.h"
+#if WASM_ENABLE_FAST_JIT != 0
+#include "../fast-jit/jit_compiler.h"
+#include "../fast-jit/jit_codecache.h"
+#endif
 
 /* Read a value of given type from the address pointed to by the given
    pointer and increase the pointer to the position just after the
@@ -497,9 +502,6 @@ load_table_import(const uint8 **p_buf, const uint8 *buf_end,
     return true;
 }
 
-unsigned
-wasm_runtime_memory_pool_size();
-
 static bool
 load_memory_import(const uint8 **p_buf, const uint8 *buf_end,
                    WASMModule *parent_module, const char *sub_module_name,
@@ -851,7 +853,7 @@ load_import_section(const uint8 *buf, const uint8 *buf_end, WASMModule *module,
             if (!strcmp(import->u.names.module_name, "wasi_unstable")
                 || !strcmp(import->u.names.module_name,
                            "wasi_snapshot_preview1")) {
-                module->is_wasi_module = true;
+                module->import_wasi_api = true;
                 break;
             }
         }
@@ -910,7 +912,7 @@ load_function_section(const uint8 *buf, const uint8 *buf_end,
     uint32 func_count;
     uint64 total_size;
     uint32 code_count = 0, code_size, type_index, i, j, k, local_type_index;
-    uint32 local_count, local_set_count, sub_local_count;
+    uint32 local_count, local_set_count, sub_local_count, local_cell_num;
     uint8 type;
     WASMFunction *func;
 
@@ -1001,8 +1003,11 @@ load_function_section(const uint8 *buf, const uint8 *buf_end,
 
             func->param_cell_num = func->func_type->param_cell_num;
             func->ret_cell_num = func->func_type->ret_cell_num;
-            func->local_cell_num =
+            local_cell_num =
                 wasm_get_cell_num(func->local_types, func->local_count);
+            bh_assert(local_cell_num <= UINT16_MAX);
+
+            func->local_cell_num = (uint16)local_cell_num;
 
             if (!init_function_local_offsets(func, error_buf, error_buf_size))
                 return false;
@@ -1987,6 +1992,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
 
     module->malloc_function = (uint32)-1;
     module->free_function = (uint32)-1;
+    module->retain_function = (uint32)-1;
 
     /* Resolve malloc/free function exported by wasm module */
     export = module->exports;
@@ -2120,7 +2126,6 @@ load_from_sections(WASMModule *module, WASMSection *sections,
             }
         }
 
-#if WASM_ENABLE_MULTI_MODULE == 0
         if (module->import_memory_count) {
             memory_import = &module->import_memories[0].u.memory;
             /* Memory init page count cannot be larger than 65536, we don't
@@ -2128,6 +2133,7 @@ load_from_sections(WASMModule *module, WASMSection *sections,
             memory_import->num_bytes_per_page *= memory_import->init_page_count;
             memory_import->init_page_count = memory_import->max_page_count = 1;
         }
+
         if (module->memory_count) {
             /* Memory init page count cannot be larger than 65536, we don't
                check integer overflow again. */
@@ -2135,8 +2141,19 @@ load_from_sections(WASMModule *module, WASMSection *sections,
             memory->num_bytes_per_page *= memory->init_page_count;
             memory->init_page_count = memory->max_page_count = 1;
         }
-#endif
     }
+
+#if WASM_ENABLE_FAST_JIT != 0
+    if (!(module->fast_jit_func_ptrs =
+              loader_malloc(sizeof(void *) * module->function_count, error_buf,
+                            error_buf_size))) {
+        return false;
+    }
+    if (!jit_compiler_compile_all(module)) {
+        set_error_buf(error_buf, error_buf_size, "fast jit compilation failed");
+        return false;
+    }
+#endif
 
 #if WASM_ENABLE_MEMORY_TRACING != 0
     wasm_runtime_dump_module_mem_consumption(module);
@@ -2149,6 +2166,9 @@ create_module(char *error_buf, uint32 error_buf_size)
 {
     WASMModule *module =
         loader_malloc(sizeof(WASMModule), error_buf, error_buf_size);
+#if WASM_ENABLE_FAST_INTERP == 0
+    bh_list_status ret;
+#endif
 
     if (!module) {
         return NULL;
@@ -2159,9 +2179,13 @@ create_module(char *error_buf, uint32 error_buf_size)
     /* Set start_function to -1, means no start function */
     module->start_function = (uint32)-1;
 
-#if WASM_ENABLE_MULTI_MODULE != 0
-    module->import_module_list = &module->import_module_list_head;
+#if WASM_ENABLE_FAST_INTERP == 0
+    module->br_table_cache_list = &module->br_table_cache_list_head;
+    ret = bh_list_init(module->br_table_cache_list);
+    bh_assert(ret == BH_LIST_SUCCESS);
+    (void)ret;
 #endif
+
     return module;
 }
 
@@ -2340,13 +2364,18 @@ load(const uint8 *buf, uint32 size, WASMModule *module, char *error_buf,
 }
 
 WASMModule *
-wasm_loader_load(const uint8 *buf, uint32 size, char *error_buf,
+wasm_loader_load(uint8 *buf, uint32 size, char *error_buf,
                  uint32 error_buf_size)
 {
     WASMModule *module = create_module(error_buf, error_buf_size);
     if (!module) {
         return NULL;
     }
+
+#if WASM_ENABLE_FAST_JIT != 0
+    module->load_addr = (uint8 *)buf;
+    module->load_size = size;
+#endif
 
     if (!load(buf, size, module, error_buf, error_buf_size)) {
         goto fail;
@@ -2432,6 +2461,28 @@ wasm_loader_unload(WASMModule *module)
             node = node_next;
         }
     }
+
+#if WASM_ENABLE_FAST_INTERP == 0
+    if (module->br_table_cache_list) {
+        BrTableCache *node = bh_list_first_elem(module->br_table_cache_list);
+        BrTableCache *node_next;
+        while (node) {
+            node_next = bh_list_elem_next(node);
+            wasm_runtime_free(node);
+            node = node_next;
+        }
+    }
+#endif
+
+#if WASM_ENABLE_FAST_JIT != 0
+    if (module->fast_jit_func_ptrs) {
+        for (i = 0; i < module->function_count; i++) {
+            if (module->fast_jit_func_ptrs[i])
+                jit_code_cache_free(module->fast_jit_func_ptrs[i]);
+        }
+        wasm_runtime_free(module->fast_jit_func_ptrs);
+    }
+#endif
 
     wasm_runtime_free(module);
 }
@@ -2558,9 +2609,23 @@ wasm_loader_find_block_addr(WASMExecEnv *exec_env, BlockAddr *block_addr_cache,
 
             case WASM_OP_BR_TABLE:
                 read_leb_uint32(p, p_end, count); /* lable num */
-                for (i = 0; i <= count; i++)      /* lableidxs */
+#if WASM_ENABLE_FAST_INTERP != 0
+                for (i = 0; i <= count; i++) /* lableidxs */
                     skip_leb_uint32(p, p_end);
+#else
+                p += count + 1;
+                while (*p == WASM_OP_NOP)
+                    p++;
+#endif
                 break;
+
+#if WASM_ENABLE_FAST_INTERP == 0
+            case EXT_OP_BR_TABLE_CACHE:
+                read_leb_uint32(p, p_end, count); /* lable num */
+                while (*p == WASM_OP_NOP)
+                    p++;
+                break;
+#endif
 
             case WASM_OP_RETURN:
                 break;
@@ -2966,8 +3031,8 @@ typedef struct WASMLoaderContext {
     /* const buffer */
     uint8 *const_buf;
     uint16 num_const;
-    uint16 const_buf_size;
     uint16 const_cell_num;
+    uint32 const_buf_size;
 
     /* processed code */
     uint8 *p_code_compiled;
@@ -3152,37 +3217,44 @@ wasm_loader_ctx_destroy(WASMLoaderContext *ctx)
 }
 
 static WASMLoaderContext *
-wasm_loader_ctx_init(WASMFunction *func)
+wasm_loader_ctx_init(WASMFunction *func, char *error_buf, uint32 error_buf_size)
 {
     WASMLoaderContext *loader_ctx =
-        loader_malloc(sizeof(WASMLoaderContext), NULL, 0);
+        loader_malloc(sizeof(WASMLoaderContext), error_buf, error_buf_size);
     if (!loader_ctx)
-        return false;
+        return NULL;
 
     loader_ctx->frame_ref_size = 32;
-    if (!(loader_ctx->frame_ref_bottom = loader_ctx->frame_ref =
-              loader_malloc(loader_ctx->frame_ref_size, NULL, 0)))
+    if (!(loader_ctx->frame_ref_bottom = loader_ctx->frame_ref = loader_malloc(
+              loader_ctx->frame_ref_size, error_buf, error_buf_size)))
         goto fail;
     loader_ctx->frame_ref_boundary = loader_ctx->frame_ref_bottom + 32;
 
     loader_ctx->frame_csp_size = sizeof(BranchBlock) * 8;
-    if (!(loader_ctx->frame_csp_bottom = loader_ctx->frame_csp =
-              loader_malloc(loader_ctx->frame_csp_size, NULL, 0)))
+    if (!(loader_ctx->frame_csp_bottom = loader_ctx->frame_csp = loader_malloc(
+              loader_ctx->frame_csp_size, error_buf, error_buf_size)))
         goto fail;
     loader_ctx->frame_csp_boundary = loader_ctx->frame_csp_bottom + 8;
 
 #if WASM_ENABLE_FAST_INTERP != 0
     loader_ctx->frame_offset_size = sizeof(int16) * 32;
     if (!(loader_ctx->frame_offset_bottom = loader_ctx->frame_offset =
-              loader_malloc(loader_ctx->frame_offset_size, NULL, 0)))
+              loader_malloc(loader_ctx->frame_offset_size, error_buf,
+                            error_buf_size)))
         goto fail;
     loader_ctx->frame_offset_boundary = loader_ctx->frame_offset_bottom + 32;
 
     loader_ctx->num_const = 0;
     loader_ctx->const_buf_size = sizeof(Const) * 8;
-    if (!(loader_ctx->const_buf =
-              loader_malloc(loader_ctx->const_buf_size, NULL, 0)))
+    if (!(loader_ctx->const_buf = loader_malloc(loader_ctx->const_buf_size,
+                                                error_buf, error_buf_size)))
         goto fail;
+
+    if (func->param_cell_num >= (int32)INT16_MAX - func->local_cell_num) {
+        set_error_buf(error_buf, error_buf_size,
+                      "fast interpreter offset overflow");
+        goto fail;
+    }
 
     loader_ctx->start_dynamic_offset = loader_ctx->dynamic_offset =
         loader_ctx->max_dynamic_offset =
@@ -3436,6 +3508,24 @@ wasm_loader_pop_frame_csp(WASMLoaderContext *ctx, char *error_buf,
         LOG_OP("%d\t", value);               \
     } while (0)
 
+#define emit_uint64(ctx, value)                     \
+    do {                                            \
+        wasm_loader_emit_const(ctx, &value, false); \
+        LOG_OP("%lld\t", value);                    \
+    } while (0)
+
+#define emit_float32(ctx, value)                   \
+    do {                                           \
+        wasm_loader_emit_const(ctx, &value, true); \
+        LOG_OP("%f\t", value);                     \
+    } while (0)
+
+#define emit_float64(ctx, value)                    \
+    do {                                            \
+        wasm_loader_emit_const(ctx, &value, false); \
+        LOG_OP("%f\t", value);                      \
+    } while (0)
+
 static bool
 wasm_loader_ctx_reinit(WASMLoaderContext *ctx)
 {
@@ -3465,6 +3555,28 @@ wasm_loader_ctx_reinit(WASMLoaderContext *ctx)
 
     /* const buf is reserved */
     return true;
+}
+
+static void
+wasm_loader_emit_const(WASMLoaderContext *ctx, void *value, bool is_32_bit)
+{
+    uint32 size = is_32_bit ? sizeof(uint32) : sizeof(uint64);
+
+    if (ctx->p_code_compiled) {
+#if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0
+        bh_assert(((uintptr_t)ctx->p_code_compiled & 1) == 0);
+#endif
+        bh_memcpy_s(ctx->p_code_compiled,
+                    (uint32)(ctx->p_code_compiled_end - ctx->p_code_compiled),
+                    value, size);
+        ctx->p_code_compiled += size;
+    }
+    else {
+#if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0
+        bh_assert((ctx->code_compiled_size & 1) == 0);
+#endif
+        ctx->code_compiled_size += size;
+    }
 }
 
 static void
@@ -3798,8 +3910,10 @@ wasm_loader_push_frame_offset(WASMLoaderContext *ctx, uint8 type,
         emit_operand(ctx, ctx->dynamic_offset);
         *(ctx->frame_offset)++ = ctx->dynamic_offset;
         ctx->dynamic_offset++;
-        if (ctx->dynamic_offset > ctx->max_dynamic_offset)
+        if (ctx->dynamic_offset > ctx->max_dynamic_offset) {
             ctx->max_dynamic_offset = ctx->dynamic_offset;
+            bh_assert(ctx->max_dynamic_offset < INT16_MAX);
+        }
     }
 
     if (is_32bit_type(type))
@@ -3813,8 +3927,10 @@ wasm_loader_push_frame_offset(WASMLoaderContext *ctx, uint8 type,
     ctx->frame_offset++;
     if (!disable_emit) {
         ctx->dynamic_offset++;
-        if (ctx->dynamic_offset > ctx->max_dynamic_offset)
+        if (ctx->dynamic_offset > ctx->max_dynamic_offset) {
             ctx->max_dynamic_offset = ctx->dynamic_offset;
+            bh_assert(ctx->max_dynamic_offset < INT16_MAX);
+        }
     }
     return true;
 }
@@ -3935,8 +4051,11 @@ wasm_loader_get_const_offset(WASMLoaderContext *ctx, uint8 type, void *value,
                              int16 *offset, char *error_buf,
                              uint32 error_buf_size)
 {
+    int8 bytes_to_increase;
     int16 operand_offset = 0;
     Const *c;
+
+    /* Search existing constant */
     for (c = (Const *)ctx->const_buf;
          (uint8 *)c < ctx->const_buf + ctx->num_const * sizeof(Const); c++) {
         if ((type == c->value_type)
@@ -3961,7 +4080,24 @@ wasm_loader_get_const_offset(WASMLoaderContext *ctx, uint8 type, void *value,
         else
             operand_offset += 1;
     }
+
     if ((uint8 *)c == ctx->const_buf + ctx->num_const * sizeof(Const)) {
+        /* New constant, append to the const buffer */
+        if ((type == VALUE_TYPE_F64) || (type == VALUE_TYPE_I64)) {
+            bytes_to_increase = 2;
+        }
+        else {
+            bytes_to_increase = 1;
+        }
+
+        /* The max cell num of const buffer is 32768 since the valid index range
+         * is -32768 ~ -1. Return an invalid index 0 to indicate the buffer is
+         * full */
+        if (ctx->const_cell_num > INT16_MAX - bytes_to_increase + 1) {
+            *offset = 0;
+            return true;
+        }
+
         if ((uint8 *)c == ctx->const_buf + ctx->const_buf_size) {
             MEM_REALLOC(ctx->const_buf, ctx->const_buf_size,
                         ctx->const_buf_size + 4 * sizeof(Const));
@@ -4761,12 +4897,21 @@ wasm_loader_prepare_bytecode(WASMModule *module, WASMFunction *func,
     local_types = func->local_types;
     local_offsets = func->local_offsets;
 
-    if (!(loader_ctx = wasm_loader_ctx_init(func))) {
-        set_error_buf(error_buf, error_buf_size, "allocate memory failed");
+    if (!(loader_ctx = wasm_loader_ctx_init(func, error_buf, error_buf_size))) {
         goto fail;
     }
 
 #if WASM_ENABLE_FAST_INTERP != 0
+    /* For the first traverse, the initial value of preserved_local_offset has
+     * not been determined, we use the INT16_MAX to represent that a slot has
+     * been copied to preserve space. For second traverse, this field will be
+     * set to the appropriate value in wasm_loader_ctx_reinit.
+     * This is for Issue #1230,
+     * https://github.com/bytecodealliance/wasm-micro-runtime/issues/1230, the
+     * drop opcodes need to know which slots are preserved, so those slots will
+     * not be treated as dynamically allocated slots */
+    loader_ctx->preserved_local_offset = INT16_MAX;
+
 re_scan:
     if (loader_ctx->code_compiled_size > 0) {
         if (!wasm_loader_ctx_reinit(loader_ctx)) {
@@ -4817,6 +4962,7 @@ re_scan:
                 uint8 value_type;
                 BlockType block_type;
 
+                p_org = p - 1;
                 value_type = read_uint8(p);
                 if (is_byte_a_type(value_type)) {
                     /* If the first byte is one of these special values:
@@ -4839,7 +4985,7 @@ re_scan:
                      * to new extended opcode so that interpreter can resolve
                      * the block quickly.
                      */
-                    *(p - 2) = EXT_OP_BLOCK + (opcode - WASM_OP_BLOCK);
+                    *p_org = EXT_OP_BLOCK + (opcode - WASM_OP_BLOCK);
 #endif
                 }
 
@@ -5042,14 +5188,10 @@ re_scan:
                     loader_ctx->frame_csp->end_addr = p - 1;
                 }
                 else {
-                    /* end of function block, function will return,
-                       ignore the following bytecodes */
-                    p = p_end;
-
-                    continue;
+                    /* end of function block, function will return */
+                    bh_assert(p == p_end);
                 }
 
-                SET_CUR_BLOCK_STACK_POLYMORPHIC_STATE(false);
                 break;
             }
 
@@ -5079,6 +5221,13 @@ re_scan:
             {
                 uint8 *ret_types = NULL;
                 uint32 ret_count = 0;
+#if WASM_ENABLE_FAST_INTERP == 0
+                uint8 *p_depth_begin, *p_depth;
+                uint32 depth, j;
+                BrTableCache *br_table_cache = NULL;
+
+                p_org = p - 1;
+#endif
 
                 read_leb_uint32(p, p_end, count);
 #if WASM_ENABLE_FAST_INTERP != 0
@@ -5086,12 +5235,64 @@ re_scan:
 #endif
                 POP_I32();
 
+#if WASM_ENABLE_FAST_INTERP == 0
+                p_depth_begin = p_depth = p;
+#endif
                 for (i = 0; i <= count; i++) {
                     if (!(frame_csp_tmp =
                               check_branch_block(loader_ctx, &p, p_end,
                                                  error_buf, error_buf_size)))
                         goto fail;
+
+#if WASM_ENABLE_FAST_INTERP == 0
+                    depth = (uint32)(loader_ctx->frame_csp - 1 - frame_csp_tmp);
+                    if (br_table_cache) {
+                        br_table_cache->br_depths[i] = depth;
+                    }
+                    else {
+                        if (depth > 255) {
+                            /* The depth cannot be stored in one byte,
+                               create br_table cache to store each depth */
+#if WASM_ENABLE_DEBUG_INTERP != 0
+                            if (!record_fast_op(module, p_org, *p_org,
+                                                error_buf, error_buf_size)) {
+                                goto fail;
+                            }
+#endif
+                            if (!(br_table_cache = loader_malloc(
+                                      offsetof(BrTableCache, br_depths)
+                                          + sizeof(uint32)
+                                                * (uint64)(count + 1),
+                                      error_buf, error_buf_size))) {
+                                goto fail;
+                            }
+                            *p_org = EXT_OP_BR_TABLE_CACHE;
+                            br_table_cache->br_table_op_addr = p_org;
+                            br_table_cache->br_count = count;
+                            /* Copy previous depths which are one byte */
+                            for (j = 0; j < i; j++) {
+                                br_table_cache->br_depths[j] = p_depth_begin[j];
+                            }
+                            br_table_cache->br_depths[i] = depth;
+                            bh_list_insert(module->br_table_cache_list,
+                                           br_table_cache);
+                        }
+                        else {
+                            /* The depth can be stored in one byte, use the
+                               byte of the leb to store it */
+                            *p_depth++ = (uint8)depth;
+                        }
+                    }
+#endif
                 }
+
+#if WASM_ENABLE_FAST_INTERP == 0
+                /* Set the tailing bytes to nop */
+                if (br_table_cache)
+                    p_depth = p_depth_begin;
+                while (p_depth < p)
+                    *p_depth++ = WASM_OP_NOP;
+#endif
 
                 RESET_STACK();
                 SET_CUR_BLOCK_STACK_POLYMORPHIC_STATE(true);
@@ -5283,8 +5484,10 @@ re_scan:
 #if WASM_ENABLE_FAST_INTERP != 0
                         skip_label();
                         loader_ctx->frame_offset--;
-                        if (*(loader_ctx->frame_offset)
-                            > loader_ctx->start_dynamic_offset)
+                        if ((*(loader_ctx->frame_offset)
+                             > loader_ctx->start_dynamic_offset)
+                            && (*(loader_ctx->frame_offset)
+                                < loader_ctx->max_dynamic_offset))
                             loader_ctx->dynamic_offset--;
 #endif
                     }
@@ -5297,8 +5500,10 @@ re_scan:
 #if WASM_ENABLE_FAST_INTERP != 0
                         skip_label();
                         loader_ctx->frame_offset -= 2;
-                        if (*(loader_ctx->frame_offset)
-                            > loader_ctx->start_dynamic_offset)
+                        if ((*(loader_ctx->frame_offset)
+                             > loader_ctx->start_dynamic_offset)
+                            && (*(loader_ctx->frame_offset)
+                                < loader_ctx->max_dynamic_offset))
                             loader_ctx->dynamic_offset -= 2;
 #endif
                     }
@@ -5554,7 +5759,7 @@ re_scan:
                     goto fail;
                 }
 
-                if (func_idx == cur_func_idx) {
+                if (func_idx == cur_func_idx + module->import_function_count) {
                     WASMTableSeg *table_seg = module->table_segments;
                     bool func_declared = false;
                     uint32 j;
@@ -5564,8 +5769,7 @@ re_scan:
                         if (table_seg->elem_type == VALUE_TYPE_FUNCREF
                             && wasm_elem_is_declarative(table_seg->mode)) {
                             for (j = 0; j < table_seg->function_count; j++) {
-                                if (table_seg->func_indexes[j]
-                                    == cur_func_idx) {
+                                if (table_seg->func_indexes[j] == func_idx) {
                                     func_declared = true;
                                     break;
                                 }
@@ -5600,7 +5804,8 @@ re_scan:
                 operand_offset = local_offset;
                 PUSH_OFFSET_TYPE(local_type);
 #else
-#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0)
+#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0) \
+    && (WASM_ENABLE_FAST_JIT == 0)
                 if (local_offset < 0x80) {
                     *p_org++ = EXT_OP_GET_LOCAL_FAST;
                     if (is_32bit_type(local_type))
@@ -5660,7 +5865,8 @@ re_scan:
                     POP_OFFSET_TYPE(local_type);
                 }
 #else
-#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0)
+#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0) \
+    && (WASM_ENABLE_FAST_JIT == 0)
                 if (local_offset < 0x80) {
                     *p_org++ = EXT_OP_SET_LOCAL_FAST;
                     if (is_32bit_type(local_type))
@@ -5716,7 +5922,8 @@ re_scan:
                              *(loader_ctx->frame_offset
                                - wasm_value_type_cell_num(local_type)));
 #else
-#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0)
+#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0) \
+    && (WASM_ENABLE_FAST_JIT == 0)
                 if (local_offset < 0x80) {
                     *p_org++ = EXT_OP_TEE_LOCAL_FAST;
                     if (is_32bit_type(local_type))
@@ -5748,12 +5955,10 @@ re_scan:
                 PUSH_TYPE(global_type);
 
 #if WASM_ENABLE_FAST_INTERP == 0
-#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0)
                 if (global_type == VALUE_TYPE_I64
                     || global_type == VALUE_TYPE_F64) {
                     *p_org = WASM_OP_GET_GLOBAL_64;
                 }
-#endif
 #else  /* else of WASM_ENABLE_FAST_INTERP */
                 if (is_64bit_type(global_type)) {
                     skip_label();
@@ -5793,7 +5998,6 @@ re_scan:
                 POP_TYPE(global_type);
 
 #if WASM_ENABLE_FAST_INTERP == 0
-#if (WASM_ENABLE_WAMR_COMPILER == 0) && (WASM_ENABLE_JIT == 0)
                 if (is_64bit_type(global_type)) {
                     *p_org = WASM_OP_SET_GLOBAL_64;
                 }
@@ -5801,7 +6005,6 @@ re_scan:
                          && global_idx == module->aux_stack_top_global_index) {
                     *p_org = WASM_OP_SET_GLOBAL_AUX_STACK;
                 }
-#endif
 #else  /* else of WASM_ENABLE_FAST_INTERP */
                 if (is_64bit_type(global_type)) {
                     skip_label();
@@ -5950,6 +6153,12 @@ re_scan:
                 skip_label();
                 disable_emit = true;
                 GET_CONST_OFFSET(VALUE_TYPE_I32, i32_const);
+
+                if (operand_offset == 0) {
+                    disable_emit = false;
+                    emit_label(WASM_OP_I32_CONST);
+                    emit_uint32(loader_ctx, i32_const);
+                }
 #else
                 (void)i32_const;
 #endif
@@ -5962,6 +6171,12 @@ re_scan:
                 skip_label();
                 disable_emit = true;
                 GET_CONST_OFFSET(VALUE_TYPE_I64, i64_const);
+
+                if (operand_offset == 0) {
+                    disable_emit = false;
+                    emit_label(WASM_OP_I64_CONST);
+                    emit_uint64(loader_ctx, i64_const);
+                }
 #endif
                 PUSH_I64();
                 break;
@@ -5974,6 +6189,12 @@ re_scan:
                 bh_memcpy_s((uint8 *)&f32_const, sizeof(float32), p_org,
                             sizeof(float32));
                 GET_CONST_F32_OFFSET(VALUE_TYPE_F32, f32_const);
+
+                if (operand_offset == 0) {
+                    disable_emit = false;
+                    emit_label(WASM_OP_F32_CONST);
+                    emit_float32(loader_ctx, f32_const);
+                }
 #endif
                 PUSH_F32();
                 break;
@@ -5987,6 +6208,12 @@ re_scan:
                 bh_memcpy_s((uint8 *)&f64_const, sizeof(float64), p_org,
                             sizeof(float64));
                 GET_CONST_F64_OFFSET(VALUE_TYPE_F64, f64_const);
+
+                if (operand_offset == 0) {
+                    disable_emit = false;
+                    emit_label(WASM_OP_F64_CONST);
+                    emit_float64(loader_ctx, f64_const);
+                }
 #endif
                 PUSH_F64();
                 break;

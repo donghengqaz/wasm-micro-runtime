@@ -50,6 +50,8 @@ typedef struct EnclaveModule {
     uint32 wasi_dir_list_size;
     char **wasi_env_list;
     uint32 wasi_env_list_size;
+    char **wasi_addr_pool_list;
+    uint32 wasi_addr_pool_list_size;
     char **wasi_argv;
     uint32 wasi_argc;
     bool is_xip_file;
@@ -131,10 +133,11 @@ align_ptr(const uint8 *p, uint32 b)
 #define AOT_SECTION_TYPE_SIGANATURE 6
 #define E_TYPE_XIP 4
 
-#define CHECK_BUF(buf, buf_end, length)                   \
-    do {                                                  \
-        if (buf + length < buf || buf + length > buf_end) \
-            return false;                                 \
+#define CHECK_BUF(buf, buf_end, length)                      \
+    do {                                                     \
+        if ((uintptr_t)buf + length < (uintptr_t)buf         \
+            || (uintptr_t)buf + length > (uintptr_t)buf_end) \
+            return false;                                    \
     } while (0)
 
 #define read_uint16(p, p_end, res)                 \
@@ -162,6 +165,7 @@ is_xip_file(const uint8 *buf, uint32 size)
 
     if (get_package_type(buf, size) != Wasm_Module_AoT)
         return false;
+
     CHECK_BUF(p, p_end, 8);
     p += 8;
     while (p < p_end) {
@@ -172,15 +176,14 @@ is_xip_file(const uint8 *buf, uint32 size)
         if (section_type == AOT_SECTION_TYPE_TARGET_INFO) {
             p += 4;
             read_uint16(p, p_end, e_type);
-            if (e_type == E_TYPE_XIP) {
-                return true;
-            }
+            return (e_type == E_TYPE_XIP) ? true : false;
         }
         else if (section_type >= AOT_SECTION_TYPE_SIGANATURE) {
             return false;
         }
         p += section_size;
     }
+
     return false;
 }
 
@@ -229,14 +232,11 @@ handle_cmd_load_module(uint64 *args, uint32 argc)
     enclave_module->wasm_file = (uint8 *)enclave_module + sizeof(EnclaveModule);
     bh_memcpy_s(enclave_module->wasm_file, wasm_file_size, wasm_file,
                 wasm_file_size);
-    if (is_xip_file) {
-        enclave_module->is_xip_file = true;
-    }
 
     if (!(enclave_module->module =
               wasm_runtime_load(enclave_module->wasm_file, wasm_file_size,
                                 error_buf, error_buf_size))) {
-        if (!is_xip_file)
+        if (!enclave_module->is_xip_file)
             wasm_runtime_free(enclave_module);
         else
             os_munmap(enclave_module, (uint32)total_size);
@@ -409,6 +409,8 @@ handle_cmd_set_wasi_args(uint64 *args, int32 argc)
     char **wasi_argv = *(char ***)args++;
     char *p, *p1;
     uint32 wasi_argc = *(uint32 *)args++;
+    char **addr_pool_list = *(char ***)args++;
+    uint32 addr_pool_list_size = *(uint32 *)args++;
     uint64 total_size = 0;
     int32 i, str_len;
 
@@ -416,6 +418,7 @@ handle_cmd_set_wasi_args(uint64 *args, int32 argc)
 
     total_size += sizeof(char *) * (uint64)dir_list_size
                   + sizeof(char *) * (uint64)env_list_size
+                  + sizeof(char *) * (uint64)addr_pool_list_size
                   + sizeof(char *) * (uint64)wasi_argc;
 
     for (i = 0; i < dir_list_size; i++) {
@@ -424,6 +427,10 @@ handle_cmd_set_wasi_args(uint64 *args, int32 argc)
 
     for (i = 0; i < env_list_size; i++) {
         total_size += strlen(env_list[i]) + 1;
+    }
+
+    for (i = 0; i < addr_pool_list_size; i++) {
+        total_size += strlen(addr_pool_list[i]) + 1;
     }
 
     for (i = 0; i < wasi_argc; i++) {
@@ -438,7 +445,7 @@ handle_cmd_set_wasi_args(uint64 *args, int32 argc)
     }
 
     p1 = p + sizeof(char *) * dir_list_size + sizeof(char *) * env_list_size
-         + sizeof(char *) * wasi_argc;
+         + sizeof(char *) * addr_pool_list_size + sizeof(char *) * wasi_argc;
 
     if (dir_list_size > 0) {
         enclave_module->wasi_dir_list = (char **)p;
@@ -464,6 +471,18 @@ handle_cmd_set_wasi_args(uint64 *args, int32 argc)
         p += sizeof(char *) * env_list_size;
     }
 
+    if (addr_pool_list_size > 0) {
+        enclave_module->wasi_addr_pool_list = (char **)p;
+        enclave_module->wasi_addr_pool_list_size = addr_pool_list_size;
+        for (i = 0; i < addr_pool_list_size; i++) {
+            enclave_module->wasi_addr_pool_list[i] = p1;
+            str_len = strlen(addr_pool_list[i]);
+            bh_memcpy_s(p1, str_len + 1, addr_pool_list[i], str_len + 1);
+            p1 += str_len + 1;
+        }
+        p += sizeof(char *) * addr_pool_list_size;
+    }
+
     if (wasi_argc > 0) {
         enclave_module->wasi_argv = (char **)p;
         enclave_module->wasi_argc = wasi_argc;
@@ -482,6 +501,11 @@ handle_cmd_set_wasi_args(uint64 *args, int32 argc)
         env_list_size, enclave_module->wasi_argv, enclave_module->wasi_argc,
         (stdinfd != -1) ? stdinfd : 0, (stdoutfd != -1) ? stdoutfd : 1,
         (stderrfd != -1) ? stderrfd : 2);
+
+    wasm_runtime_set_wasi_addr_pool(
+        enclave_module->module,
+        (const char **)enclave_module->wasi_addr_pool_list,
+        addr_pool_list_size);
 
     *args_org = true;
 }

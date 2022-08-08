@@ -50,6 +50,7 @@ typedef enum AOTSectionType {
 } AOTSectionType;
 
 typedef enum AOTCustomSectionType {
+    AOT_CUSTOM_SECTION_RAW = 0,
     AOT_CUSTOM_SECTION_NATIVE_SYMBOL = 1,
     AOT_CUSTOM_SECTION_ACCESS_CONTROL = 2,
     AOT_CUSTOM_SECTION_NAME = 3,
@@ -197,10 +198,11 @@ typedef struct AOTModule {
     uint32 literal_size;
 
 #if defined(BH_PLATFORM_WINDOWS)
-    /* extra plt data area for __xmm and __real constants
+    /* extra plt data area for __ymm, __xmm and __real constants
        in Windows platform, NULL for JIT mode */
     uint8 *extra_plt_data;
     uint32 extra_plt_data_size;
+    uint32 ymm_plt_count;
     uint32 xmm_plt_count;
     uint32 real_plt_count;
     uint32 float_plt_count;
@@ -256,7 +258,7 @@ typedef struct AOTModule {
 
 #if WASM_ENABLE_LIBC_WASI != 0
     WASIArguments wasi_args;
-    bool is_wasi_module;
+    bool import_wasi_api;
 #endif
 #if WASM_ENABLE_DEBUG_AOT != 0
     void *elf_hdr;
@@ -266,6 +268,9 @@ typedef struct AOTModule {
     const char **aux_func_names;
     uint32 *aux_func_indexes;
     uint32 aux_func_name_count;
+#endif
+#if WASM_ENABLE_LOAD_CUSTOM_SECTION != 0
+    WASMCustomSection *custom_section_list;
 #endif
 } AOTModule;
 
@@ -647,6 +652,11 @@ bool
 aot_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 table_elem_idx,
                   uint32 argc, uint32 *argv);
 
+bool
+aot_check_app_addr_and_convert(AOTModuleInstance *module_inst, bool is_str,
+                               uint32 app_buf_addr, uint32 app_buf_size,
+                               void **p_native_addr);
+
 uint32
 aot_get_plt_table_size();
 
@@ -674,11 +684,13 @@ aot_get_aux_stack(WASMExecEnv *exec_env, uint32 *start_offset, uint32 *size);
 #endif
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
-bool
-aot_signal_init();
-
+#ifndef BH_PLATFORM_WINDOWS
 void
-aot_signal_destroy();
+aot_signal_handler(WASMSignalInfo *sig_info);
+#else
+LONG
+aot_exception_handler(WASMSignalInfo *sig_info);
+#endif
 #endif
 
 void
@@ -721,11 +733,30 @@ aot_alloc_frame(WASMExecEnv *exec_env, uint32 func_index);
 void
 aot_free_frame(WASMExecEnv *exec_env);
 
-void
-aot_dump_call_stack(WASMExecEnv *exec_env);
+bool
+aot_create_call_stack(struct WASMExecEnv *exec_env);
+
+/**
+ * @brief Dump wasm call stack or get the size
+ *
+ * @param exec_env the execution environment
+ * @param print whether to print to stdout or not
+ * @param buf buffer to store the dumped content
+ * @param len length of the buffer
+ *
+ * @return when print is true, return the bytes printed out to stdout; when
+ * print is false and buf is NULL, return the size required to store the
+ * callstack content; when print is false and buf is not NULL, return the size
+ * dumped to the buffer, 0 means error and data in buf may be invalid
+ */
+uint32
+aot_dump_call_stack(WASMExecEnv *exec_env, bool print, char *buf, uint32 len);
 
 void
 aot_dump_perf_profiling(const AOTModuleInstance *module_inst);
+
+const uint8 *
+aot_get_custom_section(const AOTModule *module, const char *name, uint32 *len);
 
 #ifdef __cplusplus
 } /* end of extern "C" */

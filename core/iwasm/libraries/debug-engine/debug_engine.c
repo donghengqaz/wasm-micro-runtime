@@ -4,9 +4,8 @@
  */
 
 #include "debug_engine.h"
-
-#include "bh_log.h"
 #include "gdbserver.h"
+#include "handler.h"
 #include "bh_platform.h"
 #include "wasm_interp.h"
 #include "wasm_opcode.h"
@@ -18,12 +17,26 @@ typedef struct WASMDebugEngine {
     struct WASMDebugEngine *next;
     WASMDebugControlThread *control_thread;
     char ip_addr[128];
-    int platform_port;
-    int process_base_port;
+    int32 platform_port;
+    int32 process_base_port;
     bh_list debug_instance_list;
     korp_mutex instance_list_lock;
     bool active;
 } WASMDebugEngine;
+
+void
+on_thread_stop_event(WASMDebugInstance *debug_inst, WASMExecEnv *exec_env)
+{
+    os_mutex_lock(&debug_inst->wait_lock);
+    debug_inst->stopped_thread = exec_env;
+
+    if (debug_inst->current_state == DBG_LAUNCHING) {
+        /* In launching phase, send a signal so that handle_threadstop_request
+         * can be woken up */
+        os_cond_signal(&debug_inst->wait_cond);
+    }
+    os_mutex_unlock(&debug_inst->wait_lock);
+}
 
 static WASMDebugEngine *g_debug_engine;
 
@@ -66,7 +79,8 @@ control_thread_routine(void *arg)
 
     control_thread->debug_engine = g_debug_engine;
     control_thread->debug_instance = debug_inst;
-    strcpy(control_thread->ip_addr, g_debug_engine->ip_addr);
+    bh_strcpy_s(control_thread->ip_addr, sizeof(control_thread->ip_addr),
+                g_debug_engine->ip_addr);
     control_thread->port =
         (g_debug_engine->process_base_port == 0)
             ? 0
@@ -104,6 +118,50 @@ control_thread_routine(void *arg)
     while (true) {
         os_mutex_lock(&control_thread->wait_lock);
         if (!should_stop(control_thread)) {
+            /* send thread stop reply */
+            if (debug_inst->stopped_thread
+                && debug_inst->current_state == APP_RUNNING) {
+                uint32 status;
+                korp_tid tid;
+
+                status =
+                    (uint32)
+                        debug_inst->stopped_thread->current_status->signal_flag;
+                tid = debug_inst->stopped_thread->handle;
+
+                if (debug_inst->stopped_thread->current_status->running_status
+                    == STATUS_EXIT) {
+                    /* If the thread exits, report "W00" if it's the last thread
+                     * in the cluster, otherwise ignore this event */
+                    status = 0;
+
+                    /* By design, all the other threads should have been stopped
+                     * at this moment, so it is safe to access the
+                     * exec_env_list.len without lock */
+                    if (debug_inst->cluster->exec_env_list.len != 1) {
+                        debug_inst->stopped_thread = NULL;
+                        /* The exiting thread may wait for the signal */
+                        os_cond_signal(&debug_inst->wait_cond);
+                        os_mutex_unlock(&control_thread->wait_lock);
+                        continue;
+                    }
+                }
+
+                wasm_debug_instance_set_cur_thread(
+                    debug_inst, debug_inst->stopped_thread->handle);
+
+                send_thread_stop_status(control_thread->server, status, tid);
+
+                debug_inst->current_state = APP_STOPPED;
+                debug_inst->stopped_thread = NULL;
+
+                if (status == 0) {
+                    /* The exiting thread may wait for the signal */
+                    os_cond_signal(&debug_inst->wait_cond);
+                }
+            }
+
+            /* Processing incoming requests */
             if (!wasm_gdbserver_handle_packet(control_thread->server)) {
                 control_thread->status = STOPPED;
             }
@@ -148,8 +206,10 @@ wasm_debug_control_thread_create(WASMDebugInstance *debug_instance)
     /* wait until the debug control thread ready */
     os_cond_wait(&debug_instance->wait_cond, &debug_instance->wait_lock);
     os_mutex_unlock(&debug_instance->wait_lock);
-    if (!control_thread->server)
+    if (!control_thread->server) {
+        os_thread_join(control_thread->tid, NULL);
         goto fail1;
+    }
 
     os_mutex_lock(&g_debug_engine->instance_list_lock);
     /* create control thread success, append debug instance to debug engine */
@@ -171,6 +231,7 @@ static void
 wasm_debug_control_thread_destroy(WASMDebugInstance *debug_instance)
 {
     WASMDebugControlThread *control_thread = debug_instance->control_thread;
+
     LOG_VERBOSE("stopping control thread of debug object [%p]\n",
                 debug_instance);
     control_thread->status = STOPPED;
@@ -222,6 +283,7 @@ void
 wasm_debug_engine_destroy()
 {
     if (g_debug_engine) {
+        wasm_debug_handler_deinit();
         os_mutex_destroy(&g_debug_engine->instance_list_lock);
         wasm_runtime_free(g_debug_engine);
         g_debug_engine = NULL;
@@ -229,10 +291,15 @@ wasm_debug_engine_destroy()
 }
 
 bool
-wasm_debug_engine_init(char *ip_addr, int platform_port, int process_port)
+wasm_debug_engine_init(char *ip_addr, int32 platform_port, int32 process_port)
 {
-    if (g_debug_engine == NULL)
+    if (wasm_debug_handler_init() != 0) {
+        return false;
+    }
+
+    if (g_debug_engine == NULL) {
         g_debug_engine = wasm_debug_engine_create();
+    }
 
     if (g_debug_engine) {
         process_port -= 1;
@@ -241,10 +308,15 @@ wasm_debug_engine_init(char *ip_addr, int platform_port, int process_port)
         g_debug_engine->process_base_port =
             (process_port > 0) ? process_port : 0;
         if (ip_addr)
-            sprintf(g_debug_engine->ip_addr, "%s", ip_addr);
+            snprintf(g_debug_engine->ip_addr, sizeof(g_debug_engine->ip_addr),
+                     "%s", ip_addr);
         else
-            sprintf(g_debug_engine->ip_addr, "%s", "127.0.0.1");
+            snprintf(g_debug_engine->ip_addr, sizeof(g_debug_engine->ip_addr),
+                     "%s", "127.0.0.1");
         g_debug_engine->active = true;
+    }
+    else {
+        wasm_debug_handler_deinit();
     }
 
     return g_debug_engine != NULL ? true : false;
@@ -273,7 +345,8 @@ WASMDebugInstance *
 wasm_debug_instance_create(WASMCluster *cluster)
 {
     WASMDebugInstance *instance;
-    WASMExecEnv *exec_env;
+    WASMExecEnv *exec_env = NULL;
+    wasm_module_inst_t module_inst = NULL;
 
     if (!g_debug_engine || !g_debug_engine->active) {
         return NULL;
@@ -301,9 +374,26 @@ wasm_debug_instance_create(WASMCluster *cluster)
 
     instance->current_tid = exec_env->handle;
 
+    module_inst = wasm_runtime_get_module_inst(exec_env);
+    bh_assert(module_inst);
+
+    /* Allocate linear memory for evaluating expressions during debugging. If
+     * the allocation failed, the debugger will not be able to evaluate
+     * expressions */
+    instance->exec_mem_info.size = DEBUG_EXECUTION_MEMORY_SIZE;
+    instance->exec_mem_info.start_offset = wasm_runtime_module_malloc(
+        module_inst, instance->exec_mem_info.size, NULL);
+    if (instance->exec_mem_info.start_offset == 0) {
+        LOG_WARNING(
+            "WASM Debug Engine warning: failed to allocate linear memory for "
+            "execution. \n"
+            "Will not be able to evaluate expressions during "
+            "debugging");
+    }
+    instance->exec_mem_info.current_pos = instance->exec_mem_info.start_offset;
+
     if (!wasm_debug_control_thread_create(instance)) {
         LOG_ERROR("WASM Debug Engine error: failed to create control thread");
-        wasm_runtime_free(instance);
         goto fail3;
     }
 
@@ -366,7 +456,7 @@ wasm_debug_instance_destroy(WASMCluster *cluster)
     }
 }
 
-static WASMExecEnv *
+WASMExecEnv *
 wasm_debug_instance_get_current_env(WASMDebugInstance *instance)
 {
     WASMExecEnv *exec_env = NULL;
@@ -385,7 +475,7 @@ wasm_debug_instance_get_current_env(WASMDebugInstance *instance)
 #if WASM_ENABLE_LIBC_WASI != 0
 bool
 wasm_debug_instance_get_current_object_name(WASMDebugInstance *instance,
-                                            char name_buffer[], int len)
+                                            char name_buffer[], uint32 len)
 {
     WASMExecEnv *exec_env;
     WASIArguments *wasi_args;
@@ -402,12 +492,13 @@ wasm_debug_instance_get_current_object_name(WASMDebugInstance *instance,
     wasi_args = &module_inst->module->wasi_args;
     if (wasi_args && wasi_args->argc > 0) {
         char *argv_name = wasi_args->argv[0];
-        int name_len = strlen(argv_name);
+        uint32 name_len = (uint32)strlen(argv_name);
+
         printf("the module name is %s\n", argv_name);
         if (len - 1 >= name_len)
-            strcpy(name_buffer, argv_name);
+            bh_strcpy_s(name_buffer, len, argv_name);
         else
-            strcpy(name_buffer, argv_name + (name_len + 1 - len));
+            bh_strcpy_s(name_buffer, len, argv_name + (name_len + 1 - len));
         return true;
     }
     return false;
@@ -423,21 +514,21 @@ wasm_debug_instance_get_pid(WASMDebugInstance *instance)
     return (uint64)0;
 }
 
-uint64
+korp_tid
 wasm_debug_instance_get_tid(WASMDebugInstance *instance)
 {
     if (instance != NULL) {
-        return (uint64)instance->current_tid;
+        return instance->current_tid;
     }
-    return (uint64)0;
+    return (korp_tid)(uintptr_t)0;
 }
 
-int
-wasm_debug_instance_get_tids(WASMDebugInstance *instance, uint64 tids[],
-                             int len)
+uint32
+wasm_debug_instance_get_tids(WASMDebugInstance *instance, korp_tid tids[],
+                             uint32 len)
 {
     WASMExecEnv *exec_env;
-    int i = 0, threads_num = 0;
+    uint32 i = 0, threads_num = 0;
 
     if (!instance)
         return 0;
@@ -455,55 +546,15 @@ wasm_debug_instance_get_tids(WASMDebugInstance *instance, uint64 tids[],
     return threads_num;
 }
 
-static WASMExecEnv *
-get_stopped_thread(WASMCluster *cluster)
-{
-    WASMExecEnv *exec_env;
-
-    exec_env = bh_list_first_elem(&cluster->exec_env_list);
-    while (exec_env) {
-        if (exec_env->current_status->running_status != STATUS_RUNNING) {
-            return exec_env;
-        }
-        exec_env = bh_list_elem_next(exec_env);
-    }
-
-    return NULL;
-}
-
-uint64
-wasm_debug_instance_wait_thread(WASMDebugInstance *instance, uint64 tid,
-                                uint32 *status)
-{
-    WASMExecEnv *exec_env = NULL;
-
-    os_mutex_lock(&instance->wait_lock);
-    while ((instance->cluster->exec_env_list.len != 0)
-           && ((exec_env = get_stopped_thread(instance->cluster)) == NULL)) {
-        os_cond_wait(&instance->wait_cond, &instance->wait_lock);
-    }
-    os_mutex_unlock(&instance->wait_lock);
-
-    /* If cluster has no exec_env, then this whole cluster is exiting */
-    if (instance->cluster->exec_env_list.len == 0) {
-        *status = 0;
-        return 0;
-    }
-
-    instance->current_tid = exec_env->handle;
-    *status = exec_env->current_status->signal_flag;
-    return exec_env->handle;
-}
-
 uint32
-wasm_debug_instance_get_thread_status(WASMDebugInstance *instance, uint64 tid)
+wasm_debug_instance_get_thread_status(WASMDebugInstance *instance, korp_tid tid)
 {
     WASMExecEnv *exec_env = NULL;
 
     exec_env = bh_list_first_elem(&instance->cluster->exec_env_list);
     while (exec_env) {
         if (exec_env->handle == tid) {
-            return exec_env->current_status->signal_flag;
+            return (uint32)exec_env->current_status->signal_flag;
         }
         exec_env = bh_list_elem_next(exec_env);
     }
@@ -512,7 +563,7 @@ wasm_debug_instance_get_thread_status(WASMDebugInstance *instance, uint64 tid)
 }
 
 void
-wasm_debug_instance_set_cur_thread(WASMDebugInstance *instance, uint64 tid)
+wasm_debug_instance_set_cur_thread(WASMDebugInstance *instance, korp_tid tid)
 {
     instance->current_tid = tid;
 }
@@ -526,7 +577,8 @@ wasm_debug_instance_get_pc(WASMDebugInstance *instance)
         return 0;
 
     exec_env = wasm_debug_instance_get_current_env(instance);
-    if ((exec_env->cur_frame != NULL) && (exec_env->cur_frame->ip != NULL)) {
+    if ((exec_env != NULL) && (exec_env->cur_frame != NULL)
+        && (exec_env->cur_frame->ip != NULL)) {
         WASMModuleInstance *module_inst =
             (WASMModuleInstance *)exec_env->module_inst;
         return WASM_ADDR(
@@ -586,8 +638,10 @@ wasm_debug_instance_get_memregion(WASMDebugInstance *instance, uint64 addr)
             if (WASM_ADDR_OFFSET(addr) < module_inst->module->load_size) {
                 mem_info->start = WASM_ADDR(WasmObj, instance->id, 0);
                 mem_info->size = module_inst->module->load_size;
-                sprintf(mem_info->name, "%s", "module");
-                sprintf(mem_info->permisson, "%s", "rx");
+                snprintf(mem_info->name, sizeof(mem_info->name), "%s",
+                         "module");
+                snprintf(mem_info->permisson, sizeof(mem_info->permisson), "%s",
+                         "rx");
             }
             break;
         case WasmMemory:
@@ -601,8 +655,10 @@ wasm_debug_instance_get_memregion(WASMDebugInstance *instance, uint64 addr)
             if (WASM_ADDR_OFFSET(addr) < linear_mem_size) {
                 mem_info->start = WASM_ADDR(WasmMemory, instance->id, 0);
                 mem_info->size = linear_mem_size;
-                sprintf(mem_info->name, "%s", "memory");
-                sprintf(mem_info->permisson, "%s", "rw");
+                snprintf(mem_info->name, sizeof(mem_info->name), "%s",
+                         "memory");
+                snprintf(mem_info->permisson, sizeof(mem_info->permisson), "%s",
+                         "rw");
             }
             break;
         }
@@ -626,6 +682,8 @@ wasm_debug_instance_get_obj_mem(WASMDebugInstance *instance, uint64 offset,
 {
     WASMExecEnv *exec_env;
     WASMModuleInstance *module_inst;
+    WASMDebugBreakPoint *breakpoint;
+    WASMFastOPCodeNode *fast_opcode;
 
     if (!instance)
         return false;
@@ -643,11 +701,10 @@ wasm_debug_instance_get_obj_mem(WASMDebugInstance *instance, uint64 offset,
                     : 0;
     }
 
-    bh_memcpy_s(buf, *size, module_inst->module->load_addr + offset, *size);
+    bh_memcpy_s(buf, (uint32)*size, module_inst->module->load_addr + offset,
+                (uint32)*size);
 
-    WASMDebugBreakPoint *breakpoint =
-        bh_list_first_elem(&instance->break_point_list);
-
+    breakpoint = bh_list_first_elem(&instance->break_point_list);
     while (breakpoint) {
         if (offset <= breakpoint->addr && breakpoint->addr < offset + *size) {
             bh_memcpy_s(buf + (breakpoint->addr - offset), sizeof(break_instr),
@@ -656,8 +713,7 @@ wasm_debug_instance_get_obj_mem(WASMDebugInstance *instance, uint64 offset,
         breakpoint = bh_list_elem_next(breakpoint);
     }
 
-    WASMFastOPCodeNode *fast_opcode =
-        bh_list_first_elem(&module_inst->module->fast_opcode_list);
+    fast_opcode = bh_list_first_elem(&module_inst->module->fast_opcode_list);
     while (fast_opcode) {
         if (offset <= fast_opcode->offset
             && fast_opcode->offset < offset + *size) {
@@ -696,7 +752,8 @@ wasm_debug_instance_get_linear_mem(WASMDebugInstance *instance, uint64 offset,
             LOG_VERBOSE("wasm_debug_instance_get_linear_mem size over flow!\n");
             *size = linear_mem_size >= offset ? linear_mem_size - offset : 0;
         }
-        bh_memcpy_s(buf, *size, memory->memory_data + offset, *size);
+        bh_memcpy_s(buf, (uint32)*size, memory->memory_data + offset,
+                    (uint32)*size);
         return true;
     }
     return false;
@@ -728,7 +785,8 @@ wasm_debug_instance_set_linear_mem(WASMDebugInstance *instance, uint64 offset,
             LOG_VERBOSE("wasm_debug_instance_get_linear_mem size over flow!\n");
             *size = linear_mem_size >= offset ? linear_mem_size - offset : 0;
         }
-        bh_memcpy_s(memory->memory_data + offset, *size, buf, *size);
+        bh_memcpy_s(memory->memory_data + offset, (uint32)*size, buf,
+                    (uint32)*size);
         return true;
     }
     return false;
@@ -771,7 +829,10 @@ WASMDebugInstance *
 wasm_exec_env_get_instance(WASMExecEnv *exec_env)
 {
     WASMDebugInstance *instance = NULL;
-    bh_assert(g_debug_engine);
+
+    if (!g_debug_engine) {
+        return NULL;
+    }
 
     os_mutex_lock(&g_debug_engine->instance_list_lock);
     instance = bh_list_first_elem(&g_debug_engine->debug_instance_list);
@@ -785,13 +846,13 @@ wasm_exec_env_get_instance(WASMExecEnv *exec_env)
     return instance;
 }
 
-int
-wasm_debug_instance_get_call_stack_pcs(WASMDebugInstance *instance, uint64 tid,
-                                       uint64 buf[], uint64 size)
+uint32
+wasm_debug_instance_get_call_stack_pcs(WASMDebugInstance *instance,
+                                       korp_tid tid, uint64 buf[], uint64 size)
 {
     WASMExecEnv *exec_env;
     struct WASMInterpFrame *frame;
-    uint64 i = 0;
+    uint32 i = 0;
 
     if (!instance)
         return 0;
@@ -917,12 +978,39 @@ wasm_debug_instance_continue(WASMDebugInstance *instance)
     if (!instance)
         return false;
 
+    if (instance->current_state == APP_RUNNING) {
+        LOG_VERBOSE("Already in running state, ignore continue request");
+        return false;
+    }
+
     exec_env = bh_list_first_elem(&instance->cluster->exec_env_list);
     if (!exec_env)
         return false;
 
     while (exec_env) {
         wasm_cluster_thread_continue(exec_env);
+        exec_env = bh_list_elem_next(exec_env);
+    }
+
+    instance->current_state = APP_RUNNING;
+
+    return true;
+}
+
+bool
+wasm_debug_instance_interrupt_all_threads(WASMDebugInstance *instance)
+{
+    WASMExecEnv *exec_env;
+
+    if (!instance)
+        return false;
+
+    exec_env = bh_list_first_elem(&instance->cluster->exec_env_list);
+    if (!exec_env)
+        return false;
+
+    while (exec_env) {
+        wasm_cluster_thread_send_signal(exec_env, WAMR_SIG_TRAP);
         exec_env = bh_list_elem_next(exec_env);
     }
     return true;
@@ -942,44 +1030,61 @@ wasm_debug_instance_kill(WASMDebugInstance *instance)
 
     while (exec_env) {
         wasm_cluster_thread_send_signal(exec_env, WAMR_SIG_TERM);
+        if (instance->current_state == APP_STOPPED) {
+            /* Resume all threads so they can receive the TERM signal */
+            os_mutex_lock(&exec_env->wait_lock);
+            exec_env->current_status->running_status = STATUS_RUNNING;
+            os_cond_signal(&exec_env->wait_cond);
+            os_mutex_unlock(&exec_env->wait_lock);
+        }
         exec_env = bh_list_elem_next(exec_env);
     }
+
+    instance->current_state = APP_RUNNING;
     return true;
 }
 
 bool
-wasm_debug_instance_singlestep(WASMDebugInstance *instance, uint64 tid)
+wasm_debug_instance_singlestep(WASMDebugInstance *instance, korp_tid tid)
 {
     WASMExecEnv *exec_env;
 
     if (!instance)
         return false;
 
+    if (instance->current_state == APP_RUNNING) {
+        LOG_VERBOSE("Already in running state, ignore step request");
+        return false;
+    }
+
     exec_env = bh_list_first_elem(&instance->cluster->exec_env_list);
     if (!exec_env)
         return false;
 
     while (exec_env) {
-        if (exec_env->handle == tid || tid == (uint64)~0) {
+        if (exec_env->handle == tid || tid == (korp_tid)(uintptr_t)~0LL) {
             wasm_cluster_thread_send_signal(exec_env, WAMR_SIG_SINGSTEP);
             wasm_cluster_thread_step(exec_env);
         }
         exec_env = bh_list_elem_next(exec_env);
     }
+
+    instance->current_state = APP_RUNNING;
+
     return true;
 }
 
 bool
-wasm_debug_instance_get_local(WASMDebugInstance *instance, int frame_index,
-                              int local_index, char buf[], int *size)
+wasm_debug_instance_get_local(WASMDebugInstance *instance, int32 frame_index,
+                              int32 local_index, char buf[], int32 *size)
 {
     WASMExecEnv *exec_env;
     struct WASMInterpFrame *frame;
     WASMFunctionInstance *cur_func;
     uint8 local_type = 0xFF;
     uint32 local_offset;
-    int param_count;
-    int fi = 0;
+    int32 param_count;
+    int32 fi = 0;
 
     if (!instance)
         return false;
@@ -1029,8 +1134,8 @@ wasm_debug_instance_get_local(WASMDebugInstance *instance, int frame_index,
 }
 
 bool
-wasm_debug_instance_get_global(WASMDebugInstance *instance, int frame_index,
-                               int global_index, char buf[], int *size)
+wasm_debug_instance_get_global(WASMDebugInstance *instance, int32 frame_index,
+                               int32 global_index, char buf[], int32 *size)
 {
     WASMExecEnv *exec_env;
     struct WASMInterpFrame *frame;
@@ -1039,7 +1144,7 @@ wasm_debug_instance_get_global(WASMDebugInstance *instance, int frame_index,
     uint8 *global_addr;
     uint8 global_type = 0xFF;
     uint8 *global_data;
-    int fi = 0;
+    int32 fi = 0;
 
     if (!instance)
         return false;
@@ -1095,13 +1200,12 @@ wasm_debug_instance_get_global(WASMDebugInstance *instance, int frame_index,
 }
 
 uint64
-wasm_debug_instance_mmap(WASMDebugInstance *instance, uint32 size, int map_port)
+wasm_debug_instance_mmap(WASMDebugInstance *instance, uint32 size,
+                         int32 map_prot)
 {
     WASMExecEnv *exec_env;
-    WASMModuleInstance *module_inst;
-    uint32 offset;
-    void *native_addr;
-    (void)map_port;
+    uint32 offset = 0;
+    (void)map_prot;
 
     if (!instance)
         return 0;
@@ -1110,15 +1214,23 @@ wasm_debug_instance_mmap(WASMDebugInstance *instance, uint32 size, int map_port)
     if (!exec_env)
         return 0;
 
-    module_inst = (WASMModuleInstance *)exec_env->module_inst;
+    if (instance->exec_mem_info.start_offset == 0) {
+        return 0;
+    }
 
-    /* TODO: malloc in wasi libc maybe not be thread safe, we hope LLDB will
-             always ask for memory when threads stopped */
-    offset = wasm_runtime_module_malloc((wasm_module_inst_t)module_inst, size,
-                                        &native_addr);
-    if (!offset)
+    if ((uint64)instance->exec_mem_info.current_pos
+            - instance->exec_mem_info.start_offset + size
+        <= (uint64)instance->exec_mem_info.size) {
+        offset = instance->exec_mem_info.current_pos;
+        instance->exec_mem_info.current_pos += size;
+    }
+
+    if (offset == 0) {
         LOG_WARNING("the memory may be not enough for debug, try use larger "
                     "--heap-size");
+        return 0;
+    }
+
     return WASM_ADDR(WasmMemory, 0, offset);
 }
 
@@ -1126,8 +1238,6 @@ bool
 wasm_debug_instance_ummap(WASMDebugInstance *instance, uint64 addr)
 {
     WASMExecEnv *exec_env;
-    WASMModuleInstance *module_inst;
-    uint32 offset;
 
     if (!instance)
         return false;
@@ -1136,11 +1246,13 @@ wasm_debug_instance_ummap(WASMDebugInstance *instance, uint64 addr)
     if (!exec_env)
         return false;
 
-    module_inst = (WASMModuleInstance *)exec_env->module_inst;
-    if (WASM_ADDR_TYPE(addr) == WasmMemory) {
-        offset = WASM_ADDR_OFFSET(addr);
-        wasm_runtime_module_free((wasm_module_inst_t)module_inst, offset);
-        return true;
+    if (instance->exec_mem_info.start_offset == 0) {
+        return false;
     }
-    return false;
+
+    (void)addr;
+
+    /* Currently we don't support to free the execution memory, simply return
+     * true here */
+    return true;
 }

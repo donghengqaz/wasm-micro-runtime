@@ -16,6 +16,7 @@ static size_t total_size_munmapped = 0;
 
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024)
 
+#if !defined(__APPLE__) && !defined(__NuttX__) && defined(MADV_HUGEPAGE)
 static inline uintptr_t
 round_up(uintptr_t v, uintptr_t b)
 {
@@ -29,6 +30,7 @@ round_down(uintptr_t v, uintptr_t b)
     uintptr_t m = b - 1;
     return v & ~m;
 }
+#endif
 
 void *
 os_mmap(void *hint, size_t size, int prot, int flags)
@@ -42,7 +44,7 @@ os_mmap(void *hint, size_t size, int prot, int flags)
     page_size = (uint64)getpagesize();
     request_size = (size + page_size - 1) & ~(page_size - 1);
 
-#if !defined(__APPLE__) && !defined(__NuttX__)
+#if !defined(__APPLE__) && !defined(__NuttX__) && defined(MADV_HUGEPAGE)
     /* huge page isn't supported on MacOS and NuttX */
     if (request_size >= HUGE_PAGE_SIZE)
         /* apply one extra huge page */
@@ -146,7 +148,7 @@ os_mmap(void *hint, size_t size, int prot, int flags)
               addr, request_size, total_size_mmapped, total_size_munmapped);
 #endif
 
-#if !defined(__APPLE__) && !defined(__NuttX__)
+#if !defined(__APPLE__) && !defined(__NuttX__) && defined(MADV_HUGEPAGE)
     /* huge page isn't supported on MacOS and NuttX */
     if (request_size > HUGE_PAGE_SIZE) {
         uintptr_t huge_start, huge_end;
@@ -198,7 +200,7 @@ os_mmap(void *hint, size_t size, int prot, int flags)
             }
         }
     }
-#endif /* end of __APPLE__ || __NuttX__ */
+#endif /* end of __APPLE__ || __NuttX__ || !MADV_HUGEPAGE */
 
     return addr;
 }

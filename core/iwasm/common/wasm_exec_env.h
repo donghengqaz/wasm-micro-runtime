@@ -84,6 +84,17 @@ typedef struct WASMExecEnv {
     void **native_symbol;
 #endif
 
+#if WASM_ENABLE_FAST_JIT != 0
+    /**
+     * Cache for
+     * - jit native operations in 32-bit target which hasn't 64-bit
+     *   int/float registers, mainly for the operations of double and int64,
+     *   such as F64TOI64, F32TOI64, I64 MUL/REM, and so on.
+     * - SSE instructions.
+     **/
+    uint64 jit_cache[2];
+#endif
+
 #if WASM_ENABLE_THREAD_MGR != 0
     /* thread return value */
     void *thread_ret_value;
@@ -98,6 +109,11 @@ typedef struct WASMExecEnv {
     /* used to support debugger */
     korp_mutex wait_lock;
     korp_cond wait_cond;
+    /* the count of threads which are joining current thread */
+    uint32 wait_count;
+
+    /* whether current thread is detached */
+    bool thread_is_detached;
 #endif
 
 #if WASM_ENABLE_DEBUG_INTERP != 0
@@ -121,10 +137,6 @@ typedef struct WASMExecEnv {
 
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     WASMJmpBuf *jmpbuf_stack_top;
-#endif
-
-#if WASM_ENABLE_REF_TYPES != 0
-    uint16 nested_calling_depth;
 #endif
 
 #if WASM_ENABLE_MEMORY_PROFILING != 0
@@ -181,8 +193,12 @@ wasm_exec_env_alloc_wasm_frame(WASMExecEnv *exec_env, unsigned size)
 
     bh_assert(!(size & 3));
 
-    /* The outs area size cannot be larger than the frame size, so
-       multiplying by 2 is enough. */
+    /* For classic interpreter, the outs area doesn't contain the const cells,
+       its size cannot be larger than the frame size, so here checking stack
+       overflow with multiplying by 2 is enough. For fast interpreter, since
+       the outs area contains const cells, its size may be larger than current
+       frame size, we should check again before putting the function arguments
+       into the outs area. */
     if (addr + size * 2 > exec_env->wasm_stack.s.top_boundary) {
         /* WASM stack overflow. */
         return NULL;
@@ -249,6 +265,10 @@ wasm_exec_env_get_cur_frame(WASMExecEnv *exec_env)
 
 struct WASMModuleInstanceCommon *
 wasm_exec_env_get_module_inst(WASMExecEnv *exec_env);
+
+void
+wasm_exec_env_set_module_inst(
+    WASMExecEnv *exec_env, struct WASMModuleInstanceCommon *const module_inst);
 
 void
 wasm_exec_env_set_thread_info(WASMExecEnv *exec_env);

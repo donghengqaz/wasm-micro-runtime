@@ -34,21 +34,27 @@ endif ()
 # "X86_64", "AMD_64", "X86_32", "AARCH64[sub]", "ARM[sub]", "THUMB[sub]",
 # "MIPS", "XTENSA", "RISCV64[sub]", "RISCV32[sub]"
 if (NOT DEFINED WAMR_BUILD_TARGET)
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)")
         set (WAMR_BUILD_TARGET "AARCH64")
     elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
         set (WAMR_BUILD_TARGET "RISCV64")
     elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
         # Build as X86_64 by default in 64-bit platform
         set (WAMR_BUILD_TARGET "X86_64")
-    else ()
+    elseif (CMAKE_SIZEOF_VOID_P EQUAL 4)
         # Build as X86_32 by default in 32-bit platform
         set (WAMR_BUILD_TARGET "X86_32")
+    else ()
+        message(SEND_ERROR "Unsupported build target platform!")
     endif ()
 endif ()
 
 ################ optional according to settings ################
-if (WAMR_BUILD_INTERP EQUAL 1 OR WAMR_BUILD_JIT EQUAL 1)
+if (WAMR_BUILD_INTERP EQUAL 1 OR WAMR_BUILD_JIT EQUAL 1
+    OR WAMR_BUILD_FAST_JIT EQUAL 1)
+    if (WAMR_BUILD_FAST_JIT EQUAL 1)
+        set (WAMR_BUILD_FAST_INTERP 0)
+    endif ()
     include (${IWASM_DIR}/interpreter/iwasm_interp.cmake)
 endif ()
 
@@ -57,6 +63,10 @@ if (WAMR_BUILD_AOT EQUAL 1)
     if (WAMR_BUILD_JIT EQUAL 1)
         include (${IWASM_DIR}/compilation/iwasm_compl.cmake)
     endif ()
+endif ()
+
+if (NOT WAMR_BUILD_JIT EQUAL 1 AND WAMR_BUILD_FAST_JIT EQUAL 1)
+    include (${IWASM_DIR}/fast-jit/iwasm_fast_jit.cmake)
 endif ()
 
 if (WAMR_BUILD_APP_FRAMEWORK EQUAL 1)
@@ -87,6 +97,12 @@ endif ()
 if (WAMR_BUILD_DEBUG_INTERP EQUAL 1)
     set (WAMR_BUILD_THREAD_MGR 1)
     include (${IWASM_DIR}/libraries/debug-engine/debug_engine.cmake)
+
+    if (WAMR_BUILD_FAST_INTERP EQUAL 1)
+        set (WAMR_BUILD_FAST_INTERP 0)
+        message(STATUS
+                "Debugger doesn't work with fast interpreter, switch to classic interpreter")
+    endif ()
 endif ()
 
 if (WAMR_BUILD_THREAD_MGR EQUAL 1)
@@ -95,7 +111,7 @@ endif ()
 
 if (WAMR_BUILD_LIBC_EMCC EQUAL 1)
     include (${IWASM_DIR}/libraries/libc-emcc/libc_emcc.cmake)
-endif()
+endif ()
 
 ####################### Common sources #######################
 if (NOT MSVC)
@@ -131,6 +147,7 @@ set (source_all
     ${IWASM_INTERP_SOURCE}
     ${IWASM_AOT_SOURCE}
     ${IWASM_COMPL_SOURCE}
+    ${IWASM_FAST_JIT_SOURCE}
     ${WASM_APP_LIB_SOURCE_ALL}
     ${NATIVE_INTERFACE_SOURCE}
     ${APP_MGR_SOURCE}

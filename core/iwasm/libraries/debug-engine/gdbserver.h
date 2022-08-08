@@ -6,7 +6,7 @@
 #ifndef _GDB_SERVER_H
 #define _GDB_SERVER_H
 
-#include <stdbool.h>
+#include "bh_platform.h"
 
 #define PACKET_BUF_SIZE 0x8000
 
@@ -18,22 +18,40 @@ enum GDBStoppointType {
     eWatchpointRead,
     eWatchpointReadWrite
 };
+
+typedef enum rsp_recv_phase_t {
+    Phase_Idle,
+    Phase_Payload,
+    Phase_Checksum
+} rsp_recv_phase_t;
+
+/* Remote Serial Protocol Receive Context */
+typedef struct rsp_recv_context_t {
+    rsp_recv_phase_t phase;
+    uint16 receive_index;
+    uint16 size_in_phase;
+    uint8 check_sum;
+    /* RSP packet should not be too long */
+    char receive_buffer[1024];
+} rsp_recv_context_t;
+
 typedef struct WasmDebugPacket {
     unsigned char buf[PACKET_BUF_SIZE];
-    unsigned int size;
+    uint32 size;
 } WasmDebugPacket;
 
 struct WASMDebugControlThread;
 typedef struct WASMGDBServer {
-    int listen_fd;
-    int socket_fd;
+    bh_socket_t listen_fd;
+    bh_socket_t socket_fd;
     WasmDebugPacket pkt;
     bool noack;
     struct WASMDebugControlThread *thread;
+    rsp_recv_context_t *receive_ctx;
 } WASMGDBServer;
 
 WASMGDBServer *
-wasm_create_gdbserver(char *addr, int *port);
+wasm_create_gdbserver(const char *host, int32 *port);
 
 bool
 wasm_gdbserver_listen(WASMGDBServer *server);

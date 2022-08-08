@@ -345,8 +345,8 @@ check_type_compatible(uint8 src_type, uint8 dst_type)
         else {                                                              \
             char *func_name = #name;                                        \
             /* AOT mode, delcare the function */                            \
-            if (!(func = LLVMGetNamedFunction(comp_ctx->module, func_name)) \
-                && !(func = LLVMAddFunction(comp_ctx->module, func_name,    \
+            if (!(func = LLVMGetNamedFunction(func_ctx->module, func_name)) \
+                && !(func = LLVMAddFunction(func_ctx->module, func_name,    \
                                             func_type))) {                  \
                 aot_set_last_error("llvm add function failed.");            \
                 goto fail;                                                  \
@@ -371,10 +371,9 @@ aot_emit_aot_file_buf(AOTCompContext *comp_ctx, AOTCompData *comp_data,
 bool
 aot_emit_object_file(AOTCompContext *comp_ctx, char *file_name);
 
-uint8 *
-aot_compile_wasm_file(const uint8 *wasm_file_buf, uint32 wasm_file_size,
-                      uint32 opt_level, uint32 size_level, char *error_buf,
-                      uint32 error_buf_size, uint32 *p_aot_file_size);
+char *
+aot_generate_tempfile_name(const char *prefix, const char *extension,
+                           char *buffer, uint32 len);
 
 #ifdef __cplusplus
 } /* end of extern "C" */

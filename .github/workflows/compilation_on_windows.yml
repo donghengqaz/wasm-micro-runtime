@@ -11,6 +11,7 @@ on:
       - "ci/**"
       - "doc/**"
       - "test-tools/**"
+      - ".github/workflows/compilation_on_windows.yml"
   # will be triggered on push events
   push:
     paths-ignore:
@@ -18,6 +19,7 @@ on:
       - "ci/**"
       - "doc/**"
       - "test-tools/**"
+      - ".github/workflows/compilation_on_windows.yml"
   # allow to be triggered manually
   workflow_dispatch:
 
@@ -34,7 +36,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Cancel Workflow Action
-        uses: styfle/cancel-workflow-action@0.6.0
+        uses: styfle/cancel-workflow-action@0.9.1
         with:
           access_token: ${{ github.token }}
 
@@ -42,7 +44,7 @@ jobs:
     needs: cancel_previous
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: clone uvwasi library
         run: |
@@ -102,5 +104,12 @@ jobs:
           cd product-mini/platforms/windows
           mkdir build && cd build
           cmake .. -DWAMR_BUILD_SIMD=1
+          cmake --build . --config Release --parallel 4
+          cd .. && rm -force -r build
+      - name: Build iwasm [source debugger]
+        run: |
+          cd product-mini/platforms/windows
+          mkdir build && cd build
+          cmake .. -DWAMR_BUILD_DEBUG_INTERP=1
           cmake --build . --config Release --parallel 4
           cd .. && rm -force -r build

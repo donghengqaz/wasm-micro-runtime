@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import unittest
 
 CLANG_FORMAT_CMD = "clang-format-12"
 GIT_CLANG_FORMAT_CMD = "git-clang-format-12"
@@ -95,10 +96,17 @@ def run_clang_format(file_path: pathlib, root: pathlib) -> bool:
 
 def run_clang_format_diff(root: pathlib, commits: str) -> bool:
     """
-    Use `clang-format-12` and `git-clang-format-12` to check code
-    format of the PR, which specificed a commit range. It is required to
-    format code before `git commit` or when failed the PR check:
+    Use `clang-format-12` or `git-clang-format-12` to check code format of
+    the PR, with a commit range specified. It is required to format the
+    code before committing the PR, or it might fail to pass the CI check:
 
+    1. Install clang-format-12.0.0
+    Normally we can install it by `sudo apt-get install clang-format-12`,
+    or download the `clang+llvm-12.0.0-xxx-tar.xz` package from
+      https://github.com/llvm/llvm-project/releases/tag/llvmorg-12.0.0
+    and install it
+
+    2. Format the C/C++ source file
     ``` shell
     cd path/to/wamr/root
     clang-format-12 --style file -i path/to/file
@@ -155,7 +163,7 @@ def run_aspell(file_path: pathlib, root: pathlib) -> bool:
 
 
 def check_dir_name(path: pathlib, root: pathlib) -> bool:
-    m = re.search(INVALID_DIR_NAME_SEGMENT, str(path.relative_to(root)))
+    m = re.search(INVALID_DIR_NAME_SEGMENT, str(path.relative_to(root).parent))
     if m:
         print(f"--- found a character '_' in {m.groups()} in {path}")
 
@@ -269,6 +277,31 @@ def main() -> int:
         return False
 
     return process_entire_pr(wamr_root, options.commits)
+
+
+# run with python3 -m unitest ci/coding_guidelines_check.py
+class TestCheck(unittest.TestCase):
+    def test_check_dir_name_failed(self):
+        root = pathlib.Path("/root/Workspace/")
+        new_file_path = root.joinpath("core/shared/platform/esp_idf/espid_memmap.c")
+        self.assertFalse(check_dir_name(new_file_path, root))
+
+    def test_check_dir_name_pass(self):
+        root = pathlib.Path("/root/Workspace/")
+        new_file_path = root.joinpath("core/shared/platform/esp-idf/espid_memmap.c")
+        self.assertTrue(check_dir_name(new_file_path, root))
+
+    def test_check_file_name_failed(self):
+        new_file_path = pathlib.Path(
+            "/root/Workspace/core/shared/platform/esp-idf/espid-memmap.c"
+        )
+        self.assertFalse(check_file_name(new_file_path))
+
+    def test_check_file_name_pass(self):
+        new_file_path = pathlib.Path(
+            "/root/Workspace/core/shared/platform/esp-idf/espid_memmap.c"
+        )
+        self.assertTrue(check_file_name(new_file_path))
 
 
 if __name__ == "__main__":

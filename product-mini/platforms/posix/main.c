@@ -13,10 +13,12 @@
 #include "bh_read_file.h"
 #include "wasm_export.h"
 
+#if BH_HAS_DLFCN
+#include <dlfcn.h>
+#endif
+
 static int app_argc;
 static char **app_argv;
-
-#define MODULE_PATH ("--module-path=")
 
 /* clang-format off */
 static int
@@ -32,6 +34,10 @@ print_help()
 #endif
     printf("  --stack-size=n         Set maximum stack size in bytes, default is 16 KB\n");
     printf("  --heap-size=n          Set maximum heap size in bytes, default is 16 KB\n");
+#if WASM_ENABLE_FAST_JIT != 0
+    printf("  --jit-codecache-size=n Set fast jit maximum code cache size in bytes,\n");
+    printf("                         default is %u KB\n", FAST_JIT_DEFAULT_CODE_CACHE_SIZE / 1024);
+#endif
     printf("  --repl                 Start a very simple REPL (read-eval-print-loop) mode\n"
            "                         that runs commands in the form of \"FUNC ARG...\"\n");
 #if WASM_ENABLE_LIBC_WASI != 0
@@ -41,9 +47,18 @@ print_help()
     printf("  --dir=<dir>            Grant wasi access to the given host directories\n");
     printf("                         to the program, for example:\n");
     printf("                           --dir=<dir1> --dir=<dir2>\n");
+    printf("  --addr-pool=<addrs>    Grant wasi access to the given network addresses in\n");
+    printf("                         CIRD notation to the program, seperated with ',',\n");
+    printf("                         for example:\n");
+    printf("                           --addr-pool=1.2.3.4/15,2.3.4.5/16\n");
+#endif
+#if BH_HAS_DLFCN
+    printf("  --native-lib=<lib>     Register native libraries to the WASM module, which\n");
+    printf("                         are shared object (.so) files, for example:\n");
+    printf("                           --native-lib=test1.so --native-lib=test2.so\n");
 #endif
 #if WASM_ENABLE_MULTI_MODULE != 0
-    printf("  --module-path=         Indicate a module search path. default is current\n"
+    printf("  --module-path=<path>   Indicate a module search path. default is current\n"
            "                         directory('./')\n");
 #endif
 #if WASM_ENABLE_LIB_PTHREAD != 0
@@ -87,7 +102,7 @@ app_instance_func(wasm_module_inst_t module_inst, const char *func_name)
 static char **
 split_string(char *str, int *count)
 {
-    char **res = NULL;
+    char **res = NULL, **res1;
     char *p;
     int idx = 0;
 
@@ -95,16 +110,18 @@ split_string(char *str, int *count)
     do {
         p = strtok(str, " ");
         str = NULL;
-        res = (char **)realloc(res, sizeof(char *) * (uint32)(idx + 1));
+        res1 = res;
+        res = (char **)realloc(res1, sizeof(char *) * (uint32)(idx + 1));
         if (res == NULL) {
+            free(res1);
             return NULL;
         }
         res[idx++] = p;
     } while (p);
 
     /**
-     * since the function name,
-     * res[0] might be contains a '\' to indicate a space
+     * Due to the function name,
+     * res[0] might contain a '\' to indicate a space
      * func\name -> func name
      */
     p = strchr(res[0], '\\');
@@ -172,13 +189,57 @@ validate_env_str(char *env)
 }
 #endif
 
-#if WASM_ENABLE_GLOBAL_HEAP_POOL != 0
-#ifdef __NuttX__
-static char global_heap_buf[WASM_GLOBAL_HEAP_SIZE * BH_KB] = { 0 };
-#else
-static char global_heap_buf[10 * 1024 * 1024] = { 0 };
-#endif
-#endif
+#if BH_HAS_DLFCN
+typedef uint32 (*get_native_lib_func)(char **p_module_name,
+                                      NativeSymbol **p_native_symbols);
+
+static uint32
+load_and_register_native_libs(const char **native_lib_list,
+                              uint32 native_lib_count,
+                              void **native_handle_list)
+{
+    uint32 i, native_handle_count = 0, n_native_symbols;
+    NativeSymbol *native_symbols;
+    char *module_name;
+    void *handle;
+
+    for (i = 0; i < native_lib_count; i++) {
+        /* open the native library */
+        if (!(handle = dlopen(native_lib_list[i], RTLD_NOW | RTLD_GLOBAL))
+            && !(handle = dlopen(native_lib_list[i], RTLD_LAZY))) {
+            LOG_WARNING("warning: failed to load native library %s",
+                        native_lib_list[i]);
+            continue;
+        }
+
+        /* lookup get_native_lib func */
+        get_native_lib_func get_native_lib = dlsym(handle, "get_native_lib");
+        if (!get_native_lib) {
+            LOG_WARNING("warning: failed to lookup `get_native_lib` function "
+                        "from native lib %s",
+                        native_lib_list[i]);
+            dlclose(handle);
+            continue;
+        }
+
+        n_native_symbols = get_native_lib(&module_name, &native_symbols);
+
+        /* register native symbols */
+        if (!(n_native_symbols > 0 && module_name && native_symbols
+              && wasm_runtime_register_natives(module_name, native_symbols,
+                                               n_native_symbols))) {
+            LOG_WARNING("warning: failed to register native lib %s",
+                        native_lib_list[i]);
+            dlclose(handle);
+            continue;
+        }
+
+        native_handle_list[native_handle_count++] = handle;
+    }
+
+    return native_handle_count;
+}
+#endif /* BH_HAS_DLFCN */
 
 #if WASM_ENABLE_MULTI_MODULE != 0
 static char *
@@ -222,6 +283,14 @@ moudle_destroyer(uint8 *buffer, uint32 size)
 }
 #endif /* WASM_ENABLE_MULTI_MODULE */
 
+#if WASM_ENABLE_GLOBAL_HEAP_POOL != 0
+#ifdef __NuttX__
+static char global_heap_buf[WASM_GLOBAL_HEAP_SIZE * BH_KB] = { 0 };
+#else
+static char global_heap_buf[10 * 1024 * 1024] = { 0 };
+#endif
+#endif
+
 int
 main(int argc, char *argv[])
 {
@@ -230,6 +299,9 @@ main(int argc, char *argv[])
     uint8 *wasm_file_buf = NULL;
     uint32 wasm_file_size;
     uint32 stack_size = 16 * 1024, heap_size = 16 * 1024;
+#if WASM_ENABLE_FAST_JIT != 0
+    uint32 jit_code_cache_size = FAST_JIT_DEFAULT_CODE_CACHE_SIZE;
+#endif
     wasm_module_t wasm_module = NULL;
     wasm_module_inst_t wasm_module_inst = NULL;
     RuntimeInitArgs init_args;
@@ -244,6 +316,14 @@ main(int argc, char *argv[])
     uint32 dir_list_size = 0;
     const char *env_list[8] = { NULL };
     uint32 env_list_size = 0;
+    const char *addr_pool[8] = { NULL };
+    uint32 addr_pool_size = 0;
+#endif
+#if BH_HAS_DLFCN
+    const char *native_lib_list[8] = { NULL };
+    uint32 native_lib_count = 0;
+    void *native_handle_list[8] = { NULL };
+    uint32 native_handle_count = 0, native_handle_idx;
 #endif
 #if WASM_ENABLE_DEBUG_INTERP != 0
     char *ip_addr = NULL;
@@ -281,6 +361,13 @@ main(int argc, char *argv[])
                 return print_help();
             heap_size = atoi(argv[0] + 12);
         }
+#if WASM_ENABLE_FAST_JIT != 0
+        else if (!strncmp(argv[0], "--jit-codecache-size=", 21)) {
+            if (argv[0][21] == '\0')
+                return print_help();
+            jit_code_cache_size = atoi(argv[0] + 21);
+        }
+#endif
 #if WASM_ENABLE_LIBC_WASI != 0
         else if (!strncmp(argv[0], "--dir=", 6)) {
             if (argv[0][6] == '\0')
@@ -312,9 +399,42 @@ main(int argc, char *argv[])
                 return print_help();
             }
         }
+        /* TODO: parse the configuration file via --addr-pool-file */
+        else if (!strncmp(argv[0], "--addr-pool=", strlen("--addr-pool="))) {
+            /* like: --addr-pool=100.200.244.255/30 */
+            char *token = NULL;
+
+            if ('\0' == argv[0][12])
+                return print_help();
+
+            token = strtok(argv[0] + strlen("--addr-pool="), ",");
+            while (token) {
+                if (addr_pool_size >= sizeof(addr_pool) / sizeof(char *)) {
+                    printf("Only allow max address number %d\n",
+                           (int)(sizeof(addr_pool) / sizeof(char *)));
+                    return -1;
+                }
+
+                addr_pool[addr_pool_size++] = token;
+                token = strtok(NULL, ";");
+            }
+        }
 #endif /* WASM_ENABLE_LIBC_WASI */
+#if BH_HAS_DLFCN
+        else if (!strncmp(argv[0], "--native-lib=", 13)) {
+            if (argv[0][13] == '\0')
+                return print_help();
+            if (native_lib_count >= sizeof(native_lib_list) / sizeof(char *)) {
+                printf("Only allow max native lib number %d\n",
+                       (int)(sizeof(native_lib_list) / sizeof(char *)));
+                return -1;
+            }
+            native_lib_list[native_lib_count++] = argv[0] + 13;
+        }
+#endif
 #if WASM_ENABLE_MULTI_MODULE != 0
-        else if (!strncmp(argv[0], MODULE_PATH, strlen(MODULE_PATH))) {
+        else if (!strncmp(argv[0],
+                          "--module-path=", strlen("--module-path="))) {
             module_search_path = handle_module_path(argv[0]);
             if (!strlen(module_search_path)) {
                 return print_help();
@@ -365,6 +485,10 @@ main(int argc, char *argv[])
     init_args.mem_alloc_option.allocator.free_func = free;
 #endif
 
+#if WASM_ENABLE_FAST_JIT != 0
+    init_args.fast_jit_code_cache_size = jit_code_cache_size;
+#endif
+
 #if WASM_ENABLE_DEBUG_INTERP != 0
     init_args.platform_port = 0;
     init_args.instance_port = instance_port;
@@ -380,6 +504,11 @@ main(int argc, char *argv[])
 
 #if WASM_ENABLE_LOG != 0
     bh_log_set_verbose_level(log_verbose_level);
+#endif
+
+#if BH_HAS_DLFCN
+    native_handle_count = load_and_register_native_libs(
+        native_lib_list, native_lib_count, native_handle_list);
 #endif
 
     /* load WASM byte buffer from WASM bin file */
@@ -422,6 +551,8 @@ main(int argc, char *argv[])
 #if WASM_ENABLE_LIBC_WASI != 0
     wasm_runtime_set_wasi_args(wasm_module, dir_list, dir_list_size, NULL, 0,
                                env_list, env_list_size, argv, argc);
+
+    wasm_runtime_set_wasi_addr_pool(wasm_module, addr_pool, addr_pool_size);
 #endif
 
     /* instantiate the module */
@@ -454,6 +585,13 @@ fail2:
         os_munmap(wasm_file_buf, wasm_file_size);
 
 fail1:
+#if BH_HAS_DLFCN
+    /* unload the native libraries */
+    for (native_handle_idx = 0; native_handle_idx < native_handle_count;
+         native_handle_idx++)
+        dlclose(native_handle_list[native_handle_idx]);
+#endif
+
     /* destroy runtime environment */
     wasm_runtime_destroy();
     return 0;

@@ -54,7 +54,6 @@ wasm_exec_env_create_internal(struct WASMModuleInstanceCommon *module_inst,
     if (!(exec_env->current_status = wasm_cluster_create_exenv_status()))
         goto fail4;
 #endif
-
 #endif
 
     exec_env->module_inst = module_inst;
@@ -74,6 +73,7 @@ wasm_exec_env_create_internal(struct WASMModuleInstanceCommon *module_inst,
 #if WASM_ENABLE_MEMORY_TRACING != 0
     wasm_runtime_dump_exec_env_mem_consumption(exec_env);
 #endif
+
     return exec_env;
 
 #if WASM_ENABLE_THREAD_MGR != 0
@@ -160,10 +160,12 @@ wasm_exec_env_destroy(WASMExecEnv *exec_env)
     /* Terminate all sub-threads */
     WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
     if (cluster) {
+        wasm_cluster_terminate_all_except_self(cluster, exec_env);
 #if WASM_ENABLE_DEBUG_INTERP != 0
+        /* Must fire exit event after other threads exits, otherwise
+           the stopped thread will be overrided by other threads */
         wasm_cluster_thread_exited(exec_env);
 #endif
-        wasm_cluster_terminate_all_except_self(cluster, exec_env);
         wasm_cluster_del_exec_env(cluster, exec_env);
     }
 #endif /* end of WASM_ENABLE_THREAD_MGR */
@@ -175,6 +177,13 @@ WASMModuleInstanceCommon *
 wasm_exec_env_get_module_inst(WASMExecEnv *exec_env)
 {
     return exec_env->module_inst;
+}
+
+void
+wasm_exec_env_set_module_inst(WASMExecEnv *exec_env,
+                              WASMModuleInstanceCommon *const module_inst)
+{
+    exec_env->module_inst = module_inst;
 }
 
 void

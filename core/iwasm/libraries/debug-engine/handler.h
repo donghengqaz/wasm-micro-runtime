@@ -8,11 +8,20 @@
 
 #include "gdbserver.h"
 
-void
-handle_generay_set(WASMGDBServer *server, char *payload);
+int
+wasm_debug_handler_init();
 
 void
-handle_generay_query(WASMGDBServer *server, char *payload);
+wasm_debug_handler_deinit();
+
+void
+handle_interrupt(WASMGDBServer *server);
+
+void
+handle_general_set(WASMGDBServer *server, char *payload);
+
+void
+handle_general_query(WASMGDBServer *server, char *payload);
 
 void
 handle_v_packet(WASMGDBServer *server, char *payload);
@@ -52,4 +61,7 @@ handle_kill_request(WASMGDBServer *server, char *payload);
 
 void
 handle____request(WASMGDBServer *server, char *payload);
+
+void
+send_thread_stop_status(WASMGDBServer *server, uint32 status, korp_tid tid);
 #endif

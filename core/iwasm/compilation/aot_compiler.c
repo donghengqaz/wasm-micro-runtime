@@ -64,8 +64,9 @@ read_leb(const uint8 *buf, const uint8 *buf_end, uint32 *p_offset,
         }
         bcnt += 1;
     }
-    if (bcnt > (((maxbits + 8) >> 3) - (maxbits + 8))) {
-        aot_set_last_error("read leb failed: unsigned leb overflow.");
+    if (bcnt > (maxbits + 6) / 7) {
+        aot_set_last_error("read leb failed: "
+                           "integer representation too long");
         return false;
     }
     if (sign && (shift < maxbits) && (byte & 0x40)) {
@@ -275,8 +276,13 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
                     aot_set_last_error("allocate memory failed.");
                     goto fail;
                 }
+#if WASM_ENABLE_FAST_INTERP != 0
                 for (i = 0; i <= br_count; i++)
                     read_leb_uint32(frame_ip, frame_ip_end, br_depths[i]);
+#else
+                for (i = 0; i <= br_count; i++)
+                    br_depths[i] = *frame_ip++;
+#endif
 
                 if (!aot_compile_op_br_table(comp_ctx, func_ctx, br_depths,
                                              br_count, &frame_ip)) {
@@ -286,6 +292,35 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
 
                 wasm_runtime_free(br_depths);
                 break;
+
+#if WASM_ENABLE_FAST_INTERP == 0
+            case EXT_OP_BR_TABLE_CACHE:
+            {
+                BrTableCache *node = bh_list_first_elem(
+                    comp_ctx->comp_data->wasm_module->br_table_cache_list);
+                BrTableCache *node_next;
+                uint8 *p_opcode = frame_ip - 1;
+
+                read_leb_uint32(frame_ip, frame_ip_end, br_count);
+
+                while (node) {
+                    node_next = bh_list_elem_next(node);
+                    if (node->br_table_op_addr == p_opcode) {
+                        br_depths = node->br_depths;
+                        if (!aot_compile_op_br_table(comp_ctx, func_ctx,
+                                                     br_depths, br_count,
+                                                     &frame_ip)) {
+                            return false;
+                        }
+                        break;
+                    }
+                    node = node_next;
+                }
+                bh_assert(node);
+
+                break;
+            }
+#endif
 
             case WASM_OP_RETURN:
                 if (!aot_compile_op_return(comp_ctx, func_ctx, &frame_ip))
@@ -458,8 +493,6 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
             }
             case WASM_OP_REF_FUNC:
             {
-                uint32 func_idx;
-
                 if (!comp_ctx->enable_ref_types) {
                     goto unsupport_ref_types;
                 }
@@ -490,6 +523,7 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
                 break;
 
             case WASM_OP_GET_GLOBAL:
+            case WASM_OP_GET_GLOBAL_64:
                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
                 if (!aot_compile_op_get_global(comp_ctx, func_ctx, global_idx))
                     return false;
@@ -2538,6 +2572,151 @@ fail:
     return false;
 }
 
+static bool
+veriy_module(AOTCompContext *comp_ctx)
+{
+    char *msg = NULL;
+    bool ret;
+
+#if WASM_ENABLE_LAZY_JIT == 0
+    ret = LLVMVerifyModule(comp_ctx->module, LLVMPrintMessageAction, &msg);
+    if (!ret && msg) {
+        if (msg[0] != '\0') {
+            aot_set_last_error(msg);
+            LLVMDisposeMessage(msg);
+            return false;
+        }
+        LLVMDisposeMessage(msg);
+    }
+#else
+    uint32 i;
+
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        ret = LLVMVerifyModule(comp_ctx->modules[i], LLVMPrintMessageAction,
+                               &msg);
+        if (!ret && msg) {
+            if (msg[0] != '\0') {
+                aot_set_last_error(msg);
+                LLVMDisposeMessage(msg);
+                return false;
+            }
+            LLVMDisposeMessage(msg);
+        }
+    }
+#endif
+
+    return true;
+}
+
+static bool
+apply_func_passes(AOTCompContext *comp_ctx)
+{
+    LLVMPassManagerRef pass_mgr;
+    uint32 i;
+
+#if WASM_ENABLE_LAZY_JIT == 0
+    pass_mgr = LLVMCreateFunctionPassManagerForModule(comp_ctx->module);
+#else
+    pass_mgr = LLVMCreatePassManager();
+#endif
+
+    if (!pass_mgr) {
+        aot_set_last_error("create LLVM pass manager failed.");
+        return false;
+    }
+
+    LLVMAddPromoteMemoryToRegisterPass(pass_mgr);
+    LLVMAddInstructionCombiningPass(pass_mgr);
+    LLVMAddCFGSimplificationPass(pass_mgr);
+    LLVMAddJumpThreadingPass(pass_mgr);
+#if LLVM_VERSION_MAJOR < 12
+    LLVMAddConstantPropagationPass(pass_mgr);
+#endif
+    LLVMAddIndVarSimplifyPass(pass_mgr);
+
+    if (!comp_ctx->is_jit_mode) {
+        /* Put Vectorize passes before GVN/LICM passes as the former
+           might gain more performance improvement and the latter might
+           break the optimizations for the former */
+        LLVMAddLoopVectorizePass(pass_mgr);
+        LLVMAddSLPVectorizePass(pass_mgr);
+        LLVMAddLoopRotatePass(pass_mgr);
+#if LLVM_VERSION_MAJOR < 15
+        LLVMAddLoopUnswitchPass(pass_mgr);
+#else
+        aot_add_simple_loop_unswitch_pass(pass_mgr);
+#endif
+        LLVMAddInstructionCombiningPass(pass_mgr);
+        LLVMAddCFGSimplificationPass(pass_mgr);
+        if (!comp_ctx->enable_thread_mgr) {
+            /* These two passes may destroy the volatile semantics,
+               disable them when building as multi-thread mode */
+            LLVMAddGVNPass(pass_mgr);
+            LLVMAddLICMPass(pass_mgr);
+            LLVMAddInstructionCombiningPass(pass_mgr);
+            LLVMAddCFGSimplificationPass(pass_mgr);
+        }
+    }
+
+#if WASM_ENABLE_LAZY_JIT == 0
+    LLVMInitializeFunctionPassManager(pass_mgr);
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        LLVMRunFunctionPassManager(pass_mgr, comp_ctx->func_ctxes[i]->func);
+    }
+    LLVMFinalizeFunctionPassManager(pass_mgr);
+#else
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        LLVMRunPassManager(pass_mgr, comp_ctx->modules[i]);
+    }
+#endif
+
+    LLVMDisposePassManager(pass_mgr);
+    return true;
+}
+
+#if WASM_ENABLE_LLVM_LEGACY_PM != 0 || LLVM_VERSION_MAJOR < 12
+static bool
+apply_lto_passes(AOTCompContext *comp_ctx)
+{
+    LLVMPassManagerRef common_pass_mgr;
+    LLVMPassManagerBuilderRef pass_mgr_builder;
+#if WASM_ENABLE_LAZY_JIT != 0
+    uint32 i;
+#endif
+
+    if (!(common_pass_mgr = LLVMCreatePassManager())) {
+        aot_set_last_error("create LLVM pass manager failed");
+        return false;
+    }
+
+    if (!(pass_mgr_builder = LLVMPassManagerBuilderCreate())) {
+        aot_set_last_error("create LLVM pass manager builder failed");
+        LLVMDisposePassManager(common_pass_mgr);
+        return false;
+    }
+
+    LLVMPassManagerBuilderSetOptLevel(pass_mgr_builder, comp_ctx->opt_level);
+    LLVMPassManagerBuilderPopulateModulePassManager(pass_mgr_builder,
+                                                    common_pass_mgr);
+#if LLVM_VERSION_MAJOR < 15
+    LLVMPassManagerBuilderPopulateLTOPassManager(pass_mgr_builder,
+                                                 common_pass_mgr, true, true);
+#endif
+
+#if WASM_ENABLE_LAZY_JIT == 0
+    LLVMRunPassManager(common_pass_mgr, comp_ctx->module);
+#else
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        LLVMRunPassManager(common_pass_mgr, comp_ctx->modules[i]);
+    }
+#endif
+
+    LLVMDisposePassManager(common_pass_mgr);
+    LLVMPassManagerBuilderDispose(pass_mgr_builder);
+    return true;
+}
+#endif /* end of WASM_ENABLE_LLVM_LEGACY_PM != 0 || LLVM_VERSION_MAJOR < 12 */
+
 /* Check whether the target supports hardware atomic instructions */
 static bool
 aot_require_lower_atomic_pass(AOTCompContext *comp_ctx)
@@ -2563,125 +2742,188 @@ aot_require_lower_switch_pass(AOTCompContext *comp_ctx)
 {
     bool ret = false;
 
-    /* IR switch/case will cause .rodata relocation on riscv */
-    if (!strncmp(comp_ctx->target_arch, "riscv", 5)) {
+    /* IR switch/case will cause .rodata relocation on riscv/xtensa */
+    if (!strncmp(comp_ctx->target_arch, "riscv", 5)
+        || !strncmp(comp_ctx->target_arch, "xtensa", 6)) {
         ret = true;
     }
 
     return ret;
 }
 
+static bool
+apply_passes_for_indirect_mode(AOTCompContext *comp_ctx)
+{
+    LLVMPassManagerRef common_pass_mgr;
+#if WASM_ENABLE_LAZY_JIT != 0
+    uint32 i;
+#endif
+
+    if (!(common_pass_mgr = LLVMCreatePassManager())) {
+        aot_set_last_error("create pass manager failed");
+        return false;
+    }
+
+    aot_add_expand_memory_op_pass(common_pass_mgr);
+
+    if (aot_require_lower_atomic_pass(comp_ctx))
+        LLVMAddLowerAtomicPass(common_pass_mgr);
+
+    if (aot_require_lower_switch_pass(comp_ctx))
+        LLVMAddLowerSwitchPass(common_pass_mgr);
+
+#if WASM_ENABLE_LAZY_JIT == 0
+    LLVMRunPassManager(common_pass_mgr, comp_ctx->module);
+#else
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        LLVMRunPassManager(common_pass_mgr, comp_ctx->modules[i]);
+    }
+#endif
+
+    LLVMDisposePassManager(common_pass_mgr);
+    return true;
+}
+
 bool
 aot_compile_wasm(AOTCompContext *comp_ctx)
 {
-    char *msg = NULL;
-    bool ret;
     uint32 i;
+#if WASM_ENABLE_LAZY_JIT != 0
+    LLVMErrorRef err;
+    LLVMOrcJITDylibRef orc_main_dylib;
+    LLVMOrcThreadSafeModuleRef orc_thread_safe_module;
+#endif
 
     if (!aot_validate_wasm(comp_ctx)) {
         return false;
     }
 
     bh_print_time("Begin to compile WASM bytecode to LLVM IR");
-
-    for (i = 0; i < comp_ctx->func_ctx_count; i++)
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
         if (!aot_compile_func(comp_ctx, i)) {
-#if 0
-            LLVMDumpModule(comp_ctx->module);
-            char *err;
-            LLVMTargetMachineEmitToFile(comp_ctx->target_machine,
-                                        comp_ctx->module, "./test.o",
-                                        LLVMObjectFile, &err);
-#endif
             return false;
         }
-
-#if 0
-    LLVMDumpModule(comp_ctx->module);
-    /* Clear error no, LLVMDumpModule may set errno */
-    errno = 0;
-#endif
+    }
 
 #if WASM_ENABLE_DEBUG_AOT != 0
     LLVMDIBuilderFinalize(comp_ctx->debug_builder);
 #endif
 
     bh_print_time("Begin to verify LLVM module");
-
-    ret = LLVMVerifyModule(comp_ctx->module, LLVMPrintMessageAction, &msg);
-    if (!ret && msg) {
-        if (msg[0] != '\0') {
-            aot_set_last_error(msg);
-            LLVMDisposeMessage(msg);
-            return false;
-        }
-        LLVMDisposeMessage(msg);
+    if (!veriy_module(comp_ctx)) {
+        return false;
     }
 
-    bh_print_time("Begin to run function optimization passes");
-
-    /* Run function pass manager */
     if (comp_ctx->optimize) {
-        LLVMInitializeFunctionPassManager(comp_ctx->pass_mgr);
-        for (i = 0; i < comp_ctx->func_ctx_count; i++)
-            LLVMRunFunctionPassManager(comp_ctx->pass_mgr,
-                                       comp_ctx->func_ctxes[i]->func);
+        if (comp_ctx->is_jit_mode) {
+            /* Only run func passes for JIT mode */
+            bh_print_time("Begin to run func optimization passes");
+            if (!apply_func_passes(comp_ctx)) {
+                return false;
+            }
+        }
+        else {
+#if WASM_ENABLE_LLVM_LEGACY_PM == 0 && LLVM_VERSION_MAJOR >= 12
+            /* Run llvm new pass manager for AOT compiler if llvm
+               legacy pass manager isn't used */
+            bh_print_time("Begin to run llvm optimization passes");
+            aot_apply_llvm_new_pass_manager(comp_ctx);
+#else
+            /* Run func passes and lto passes for AOT compiler if llvm
+               legacy pass manager is used */
+            bh_print_time("Begin to run func optimization passes");
+            if (!apply_func_passes(comp_ctx)) {
+                return false;
+            }
+            if (!comp_ctx->disable_llvm_lto) {
+                bh_print_time("Begin to run lto optimization passes");
+                if (!apply_lto_passes(comp_ctx)) {
+                    return false;
+                }
+            }
+#endif
+            /* Run passes for AOT indirect mode */
+            if (comp_ctx->is_indirect_mode) {
+                bh_print_time("Begin to run optimization passes "
+                              "for indirect mode");
+                if (!apply_passes_for_indirect_mode(comp_ctx)) {
+                    return false;
+                }
+            }
+        }
     }
 
-    /* Run common pass manager */
-    if (comp_ctx->optimize && !comp_ctx->is_jit_mode
-        && !comp_ctx->disable_llvm_lto) {
-        LLVMPassManagerRef common_pass_mgr = NULL;
-        LLVMPassManagerBuilderRef pass_mgr_builder = NULL;
+#if WASM_ENABLE_LAZY_JIT != 0
+    orc_main_dylib = LLVMOrcLLJITGetMainJITDylib(comp_ctx->orc_lazyjit);
+    if (!orc_main_dylib) {
+        aot_set_last_error("failed to get orc jit main dynmaic library");
+        return false;
+    }
 
-        if (!(common_pass_mgr = LLVMCreatePassManager())) {
-            aot_set_last_error("create pass manager failed");
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        orc_thread_safe_module = LLVMOrcCreateNewThreadSafeModule(
+            comp_ctx->modules[i], comp_ctx->orc_thread_safe_context);
+        if (!orc_thread_safe_module) {
+            aot_set_last_error("failed to create thread safe module");
             return false;
         }
 
-        if (!(pass_mgr_builder = LLVMPassManagerBuilderCreate())) {
-            aot_set_last_error("create pass manager builder failed");
-            LLVMDisposePassManager(common_pass_mgr);
+        if ((err = LLVMOrcLLJITAddLLVMIRModule(comp_ctx->orc_lazyjit,
+                                               orc_main_dylib,
+                                               orc_thread_safe_module))) {
+            /* If adding the ThreadSafeModule fails then we need to clean it up
+               by ourselves, otherwise the orc jit will manage the memory. */
+            LLVMOrcDisposeThreadSafeModule(orc_thread_safe_module);
+            aot_handle_llvm_errmsg("failed to addIRModule", err);
             return false;
         }
-
-        LLVMPassManagerBuilderSetOptLevel(pass_mgr_builder,
-                                          comp_ctx->opt_level);
-        LLVMPassManagerBuilderPopulateModulePassManager(pass_mgr_builder,
-                                                        common_pass_mgr);
-        LLVMPassManagerBuilderPopulateLTOPassManager(
-            pass_mgr_builder, common_pass_mgr, true, true);
-
-        LLVMRunPassManager(common_pass_mgr, comp_ctx->module);
-
-        LLVMDisposePassManager(common_pass_mgr);
-        LLVMPassManagerBuilderDispose(pass_mgr_builder);
     }
+#endif
 
-    if (comp_ctx->optimize && comp_ctx->is_indirect_mode) {
-        LLVMPassManagerRef common_pass_mgr = NULL;
-
-        if (!(common_pass_mgr = LLVMCreatePassManager())) {
-            aot_set_last_error("create pass manager failed");
-            return false;
-        }
-
-        aot_add_expand_memory_op_pass(common_pass_mgr);
-
-        if (aot_require_lower_atomic_pass(comp_ctx))
-            LLVMAddLowerAtomicPass(common_pass_mgr);
-
-        if (aot_require_lower_switch_pass(comp_ctx))
-            LLVMAddLowerSwitchPass(common_pass_mgr);
-
-        LLVMRunPassManager(common_pass_mgr, comp_ctx->module);
-
-        LLVMDisposePassManager(common_pass_mgr);
+#if 0
+#if WASM_ENABLE_LAZY_JIT == 0
+    LLVMDumpModule(comp_ctx->module);
+#else
+    for (i = 0; i < comp_ctx->func_ctx_count; i++) {
+        LLVMDumpModule(comp_ctx->modules[i]);
+        os_printf("\n");
     }
-
+#endif
+#endif
     return true;
 }
 
+#if !(defined(_WIN32) || defined(_WIN32_))
+char *
+aot_generate_tempfile_name(const char *prefix, const char *extension,
+                           char *buffer, uint32 len)
+{
+    int fd, name_len;
+
+    name_len = snprintf(buffer, len, "%s-XXXXXX", prefix);
+
+    if ((fd = mkstemp(buffer)) <= 0) {
+        aot_set_last_error("make temp file failed.");
+        return NULL;
+    }
+
+    /* close and remove temp file */
+    close(fd);
+    unlink(buffer);
+
+    /* Check if buffer length is enough */
+    /* name_len + '.' + extension + '\0' */
+    if (name_len + 1 + strlen(extension) + 1 > len) {
+        aot_set_last_error("temp file name too long.");
+        return NULL;
+    }
+
+    snprintf(buffer + name_len, len - name_len, ".%s", extension);
+    return buffer;
+}
+#endif /* end of !(defined(_WIN32) || defined(_WIN32_)) */
+
+#if WASM_ENABLE_LAZY_JIT == 0
 bool
 aot_emit_llvm_file(AOTCompContext *comp_ctx, const char *file_name)
 {
@@ -2710,6 +2952,83 @@ aot_emit_object_file(AOTCompContext *comp_ctx, char *file_name)
 
     bh_print_time("Begin to emit object file");
 
+#if !(defined(_WIN32) || defined(_WIN32_))
+    if (comp_ctx->external_llc_compiler || comp_ctx->external_asm_compiler) {
+        char cmd[1024];
+        int ret;
+
+        if (comp_ctx->external_llc_compiler) {
+            char bc_file_name[64];
+
+            if (!aot_generate_tempfile_name("wamrc-bc", "bc", bc_file_name,
+                                            sizeof(bc_file_name))) {
+                return false;
+            }
+
+            if (LLVMWriteBitcodeToFile(comp_ctx->module, bc_file_name) != 0) {
+                aot_set_last_error("emit llvm bitcode file failed.");
+                return false;
+            }
+
+            snprintf(cmd, sizeof(cmd), "%s %s -o %s %s",
+                     comp_ctx->external_llc_compiler,
+                     comp_ctx->llc_compiler_flags ? comp_ctx->llc_compiler_flags
+                                                  : "-O3 -c",
+                     file_name, bc_file_name);
+            LOG_VERBOSE("invoking external LLC compiler:\n\t%s", cmd);
+
+            ret = system(cmd);
+            /* remove temp bitcode file */
+            unlink(bc_file_name);
+
+            if (ret != 0) {
+                aot_set_last_error("failed to compile LLVM bitcode to obj file "
+                                   "with external LLC compiler.");
+                return false;
+            }
+        }
+        else if (comp_ctx->external_asm_compiler) {
+            char asm_file_name[64];
+
+            if (!aot_generate_tempfile_name("wamrc-asm", "s", asm_file_name,
+                                            sizeof(asm_file_name))) {
+                return false;
+            }
+
+            if (LLVMTargetMachineEmitToFile(comp_ctx->target_machine,
+                                            comp_ctx->module, asm_file_name,
+                                            LLVMAssemblyFile, &err)
+                != 0) {
+                if (err) {
+                    LLVMDisposeMessage(err);
+                    err = NULL;
+                }
+                aot_set_last_error("emit elf to assembly file failed.");
+                return false;
+            }
+
+            snprintf(cmd, sizeof(cmd), "%s %s -o %s %s",
+                     comp_ctx->external_asm_compiler,
+                     comp_ctx->asm_compiler_flags ? comp_ctx->asm_compiler_flags
+                                                  : "-O3 -c",
+                     file_name, asm_file_name);
+            LOG_VERBOSE("invoking external ASM compiler:\n\t%s", cmd);
+
+            ret = system(cmd);
+            /* remove temp assembly file */
+            unlink(asm_file_name);
+
+            if (ret != 0) {
+                aot_set_last_error("failed to compile Assembly file to obj "
+                                   "file with external ASM compiler.");
+                return false;
+            }
+        }
+
+        return true;
+    }
+#endif /* end of !(defined(_WIN32) || defined(_WIN32_)) */
+
     if (!strncmp(LLVMGetTargetName(target), "arc", 3))
         /* Emit to assmelby file instead for arc target
            as it cannot emit to object file */
@@ -2728,204 +3047,4 @@ aot_emit_object_file(AOTCompContext *comp_ctx, char *file_name)
 
     return true;
 }
-
-typedef struct AOTFileMap {
-    uint8 *wasm_file_buf;
-    uint32 wasm_file_size;
-    uint8 *aot_file_buf;
-    uint32 aot_file_size;
-    struct AOTFileMap *next;
-} AOTFileMap;
-
-static bool aot_compile_wasm_file_inited = false;
-static AOTFileMap *aot_file_maps = NULL;
-static korp_mutex aot_file_map_lock;
-
-bool
-aot_compile_wasm_file_init()
-{
-    if (aot_compile_wasm_file_inited) {
-        return true;
-    }
-
-    if (BHT_OK != os_mutex_init(&aot_file_map_lock)) {
-        return false;
-    }
-
-    aot_file_maps = NULL;
-    aot_compile_wasm_file_inited = true;
-    return true;
-}
-
-void
-aot_compile_wasm_file_destroy()
-{
-    AOTFileMap *file_map = aot_file_maps, *file_map_next;
-
-    if (!aot_compile_wasm_file_inited) {
-        return;
-    }
-
-    while (file_map) {
-        file_map_next = file_map->next;
-
-        wasm_runtime_free(file_map->wasm_file_buf);
-        wasm_runtime_free(file_map->aot_file_buf);
-        wasm_runtime_free(file_map);
-
-        file_map = file_map_next;
-    }
-
-    aot_file_maps = NULL;
-    os_mutex_destroy(&aot_file_map_lock);
-    aot_compile_wasm_file_inited = false;
-}
-
-static void
-set_error_buf(char *error_buf, uint32 error_buf_size, const char *string)
-{
-    if (error_buf != NULL) {
-        snprintf(error_buf, error_buf_size, "WASM module load failed: %s",
-                 string);
-    }
-}
-
-uint8 *
-aot_compile_wasm_file(const uint8 *wasm_file_buf, uint32 wasm_file_size,
-                      uint32 opt_level, uint32 size_level, char *error_buf,
-                      uint32 error_buf_size, uint32 *p_aot_file_size)
-{
-    WASMModule *wasm_module = NULL;
-    AOTCompData *comp_data = NULL;
-    AOTCompContext *comp_ctx = NULL;
-    RuntimeInitArgs init_args;
-    AOTCompOption option = { 0 };
-    AOTFileMap *file_map = NULL, *file_map_next;
-    uint8 *wasm_file_buf_cloned = NULL;
-    uint8 *aot_file_buf = NULL;
-    uint32 aot_file_size;
-
-    option.is_jit_mode = false;
-    option.opt_level = opt_level;
-    option.size_level = size_level;
-    option.output_format = AOT_FORMAT_FILE;
-    /* default value, enable or disable depends on the platform */
-    option.bounds_checks = 2;
-    option.enable_aux_stack_check = true;
-#if WASM_ENABLE_BULK_MEMORY != 0
-    option.enable_bulk_memory = true;
-#endif
-#if WASM_ENABLE_THREAD_MGR != 0
-    option.enable_thread_mgr = true;
-#endif
-#if WASM_ENABLE_TAIL_CALL != 0
-    option.enable_tail_call = true;
-#endif
-#if WASM_ENABLE_SIMD != 0
-    option.enable_simd = true;
-#endif
-#if WASM_ENABLE_REF_TYPES != 0
-    option.enable_ref_types = true;
-#endif
-#if (WASM_ENABLE_PERF_PROFILING != 0) || (WASM_ENABLE_DUMP_CALL_STACK != 0)
-    option.enable_aux_stack_frame = true;
-#endif
-
-    memset(&init_args, 0, sizeof(RuntimeInitArgs));
-
-    init_args.mem_alloc_type = Alloc_With_Allocator;
-    init_args.mem_alloc_option.allocator.malloc_func = malloc;
-    init_args.mem_alloc_option.allocator.realloc_func = realloc;
-    init_args.mem_alloc_option.allocator.free_func = free;
-
-    os_mutex_lock(&aot_file_map_lock);
-
-    /* lookup the file maps */
-    file_map = aot_file_maps;
-    while (file_map) {
-        file_map_next = file_map->next;
-
-        if (wasm_file_size == file_map->wasm_file_size
-            && memcmp(wasm_file_buf, file_map->wasm_file_buf, wasm_file_size)
-                   == 0) {
-            os_mutex_unlock(&aot_file_map_lock);
-            /* found */
-            *p_aot_file_size = file_map->aot_file_size;
-            return file_map->aot_file_buf;
-        }
-
-        file_map = file_map_next;
-    }
-
-    /* not found, initialize file map and clone wasm file */
-    if (!(file_map = wasm_runtime_malloc(sizeof(AOTFileMap)))
-        || !(wasm_file_buf_cloned = wasm_runtime_malloc(wasm_file_size))) {
-        set_error_buf(error_buf, error_buf_size, "allocate memory failed");
-        goto fail1;
-    }
-
-    bh_memcpy_s(wasm_file_buf_cloned, wasm_file_size, wasm_file_buf,
-                wasm_file_size);
-    memset(file_map, 0, sizeof(AOTFileMap));
-    file_map->wasm_file_buf = wasm_file_buf_cloned;
-    file_map->wasm_file_size = wasm_file_size;
-
-    /* load WASM module */
-    if (!(wasm_module = wasm_load(wasm_file_buf, wasm_file_size, error_buf,
-                                  sizeof(error_buf)))) {
-        goto fail1;
-    }
-
-    if (!(comp_data = aot_create_comp_data(wasm_module))) {
-        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
-        goto fail2;
-    }
-
-    if (!(comp_ctx = aot_create_comp_context(comp_data, &option))) {
-        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
-        goto fail3;
-    }
-
-    if (!aot_compile_wasm(comp_ctx)) {
-        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
-        goto fail4;
-    }
-
-    if (!(aot_file_buf =
-              aot_emit_aot_file_buf(comp_ctx, comp_data, &aot_file_size))) {
-        set_error_buf(error_buf, error_buf_size, aot_get_last_error());
-        goto fail4;
-    }
-
-    file_map->aot_file_buf = aot_file_buf;
-    file_map->aot_file_size = aot_file_size;
-
-    if (!aot_file_maps)
-        aot_file_maps = file_map;
-    else {
-        file_map->next = aot_file_maps;
-        aot_file_maps = file_map;
-    }
-
-    *p_aot_file_size = aot_file_size;
-
-fail4:
-    /* Destroy compiler context */
-    aot_destroy_comp_context(comp_ctx);
-fail3:
-    /* Destroy compile data */
-    aot_destroy_comp_data(comp_data);
-fail2:
-    wasm_unload(wasm_module);
-fail1:
-    if (!aot_file_buf) {
-        if (wasm_file_buf_cloned)
-            wasm_runtime_free(wasm_file_buf_cloned);
-        if (file_map)
-            wasm_runtime_free(file_map);
-    }
-
-    os_mutex_unlock(&aot_file_map_lock);
-
-    return aot_file_buf;
-}
+#endif /* end of WASM_ENABLE_LAZY_JIT == 0 */

@@ -40,11 +40,15 @@ print_help()
     printf("                           --dir=<dir1> --dir=<dir2>\n");
 #endif
 #if WASM_ENABLE_MULTI_MODULE != 0
-    printf("  --module-path=         Indicate a module search path. default is current\n"
+    printf("  --module-path=<path>   Indicate a module search path. default is current\n"
            "                         directory('./')\n");
 #endif
 #if WASM_ENABLE_LIB_PTHREAD != 0
     printf("  --max-threads=n        Set maximum thread number per cluster, default is 4\n");
+#endif
+#if WASM_ENABLE_DEBUG_INTERP != 0
+    printf("  -g=ip:port             Set the debug sever address, default is debug disabled\n");
+    printf("                           if port is 0, then a random port will be used\n");
 #endif
     return 1;
 }
@@ -80,7 +84,7 @@ app_instance_func(wasm_module_inst_t module_inst, const char *func_name)
 static char **
 split_string(char *str, int *count)
 {
-    char **res = NULL;
+    char **res = NULL, **res1;
     char *p, *next_token;
     int idx = 0;
 
@@ -88,16 +92,18 @@ split_string(char *str, int *count)
     do {
         p = strtok_s(str, " ", &next_token);
         str = NULL;
-        res = (char **)realloc(res, sizeof(char *) * (uint32)(idx + 1));
+        res1 = res;
+        res = (char **)realloc(res1, sizeof(char *) * (uint32)(idx + 1));
         if (res == NULL) {
+            free(res1);
             return NULL;
         }
         res[idx++] = p;
     } while (p);
 
     /**
-     * since the function name,
-     * res[0] might be contains a '\' to indicate a space
+     * Due to the function name,
+     * res[0] might contain a '\' to indicate a space
      * func\name -> func name
      */
     p = strchr(res[0], '\\');
@@ -230,11 +236,17 @@ main(int argc, char *argv[])
     int log_verbose_level = 2;
 #endif
     bool is_repl_mode = false;
+    bool is_xip_file = false;
 #if WASM_ENABLE_LIBC_WASI != 0
     const char *dir_list[8] = { NULL };
     uint32 dir_list_size = 0;
     const char *env_list[8] = { NULL };
     uint32 env_list_size = 0;
+#endif
+#if WASM_ENABLE_DEBUG_INTERP != 0
+    char *ip_addr = NULL;
+    /* int platform_port = 0; */
+    int instance_port = 0;
 #endif
 
     /* Process options. */
@@ -314,6 +326,19 @@ main(int argc, char *argv[])
             wasm_runtime_set_max_thread_num(atoi(argv[0] + 14));
         }
 #endif
+#if WASM_ENABLE_DEBUG_INTERP != 0
+        else if (!strncmp(argv[0], "-g=", 3)) {
+            char *port_str = strchr(argv[0] + 3, ':');
+            char *port_end;
+            if (port_str == NULL)
+                return print_help();
+            *port_str = '\0';
+            instance_port = strtoul(port_str + 1, &port_end, 10);
+            if (port_str[1] == '\0' || *port_end != '\0')
+                return print_help();
+            ip_addr = argv[0] + 3;
+        }
+#endif
         else
             return print_help();
     }
@@ -338,6 +363,13 @@ main(int argc, char *argv[])
     init_args.mem_alloc_option.allocator.free_func = free;
 #endif
 
+#if WASM_ENABLE_DEBUG_INTERP != 0
+    init_args.platform_port = 0;
+    init_args.instance_port = instance_port;
+    if (ip_addr)
+        strcpy(init_args.ip_addr, ip_addr);
+#endif
+
     /* initialize runtime environment */
     if (!wasm_runtime_full_init(&init_args)) {
         printf("Init runtime environment failed.\n");
@@ -352,6 +384,27 @@ main(int argc, char *argv[])
     if (!(wasm_file_buf =
               (uint8 *)bh_read_file_to_buffer(wasm_file, &wasm_file_size)))
         goto fail1;
+
+#if WASM_ENABLE_AOT != 0
+    if (wasm_runtime_is_xip_file(wasm_file_buf, wasm_file_size)) {
+        uint8 *wasm_file_mapped;
+        int map_prot = MMAP_PROT_READ | MMAP_PROT_WRITE | MMAP_PROT_EXEC;
+        int map_flags = MMAP_MAP_32BIT;
+
+        if (!(wasm_file_mapped =
+                  os_mmap(NULL, (uint32)wasm_file_size, map_prot, map_flags))) {
+            printf("mmap memory failed\n");
+            wasm_runtime_free(wasm_file_buf);
+            goto fail1;
+        }
+
+        bh_memcpy_s(wasm_file_mapped, wasm_file_size, wasm_file_buf,
+                    wasm_file_size);
+        wasm_runtime_free(wasm_file_buf);
+        wasm_file_buf = wasm_file_mapped;
+        is_xip_file = true;
+    }
+#endif
 
 #if WASM_ENABLE_MULTI_MODULE != 0
     wasm_runtime_set_module_reader(module_reader_callback, moudle_destroyer);
@@ -393,7 +446,10 @@ fail3:
 
 fail2:
     /* free the file buffer */
-    wasm_runtime_free(wasm_file_buf);
+    if (!is_xip_file)
+        wasm_runtime_free(wasm_file_buf);
+    else
+        os_munmap(wasm_file_buf, wasm_file_size);
 
 fail1:
     /* destroy runtime environment */

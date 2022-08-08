@@ -8,7 +8,7 @@
 function DEBUG() {
   [[ -n $(env | grep "\<DEBUG\>") ]] && $@
 }
-DEBUG set -xEevuo pipefail
+DEBUG set -xv pipefail
 
 function help()
 {
@@ -16,7 +16,7 @@ function help()
     echo "-c clean previous test results, not start test"
     echo "-s {suite_name} test only one suite (spec)"
     echo "-m set compile target of iwasm(x86_64\x86_32\armv7_vfp\thumbv7_vfp\riscv64_lp64d\riscv64_lp64)"
-    echo "-t set compile type of iwasm(classic-interp\fast-interp\jit\aot)"
+    echo "-t set compile type of iwasm(classic-interp\fast-interp\jit\aot\fast-jit)"
     echo "-M enable multi module feature"
     echo "-p enable multi thread feature"
     echo "-S enable SIMD feature"
@@ -29,7 +29,7 @@ function help()
 OPT_PARSED=""
 WABT_BINARY_RELEASE="NO"
 #default type
-TYPE=("classic-interp" "fast-interp" "jit" "aot")
+TYPE=("classic-interp" "fast-interp" "jit" "aot" "fast-jit")
 #default target
 TARGET="X86_64"
 ENABLE_MULTI_MODULE=0
@@ -80,7 +80,7 @@ do
         t)
         echo "set compile type of wamr " ${OPTARG}
         if [[ ${OPTARG} != "classic-interp" && ${OPTARG} != "fast-interp" \
-            && ${OPTARG} != "jit" && ${OPTARG} != "aot" ]]; then
+            && ${OPTARG} != "jit" && ${OPTARG} != "aot" && ${OPTARG} != "fast-jit" ]]; then
             echo "*----- please varify a type of compile when using -t! -----*"
             help
             exit 1
@@ -186,11 +186,19 @@ readonly AOT_COMPILE_FLAGS="\
     -DWAMR_BUILD_SPEC_TEST=1 \
     -DCOLLECT_CODE_COVERAGE=${COLLECT_CODE_COVERAGE}"
 
+readonly FAST_JIT_COMPILE_FLAGS="\
+    -DWAMR_BUILD_TARGET=${TARGET} \
+    -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=0 \
+    -DWAMR_BUILD_JIT=0 -DWAMR_BUILD_AOT=0 \
+    -DWAMR_BUILD_FAST_JIT=1 \
+    -DWAMR_BUILD_SPEC_TEST=1"
+
 readonly COMPILE_FLAGS=(
         "${CLASSIC_INTERP_COMPILE_FLAGS}"
         "${FAST_INTERP_COMPILE_FLAGS}"
         "${JIT_COMPILE_FLAGS}"
         "${AOT_COMPILE_FLAGS}"
+        "${FAST_JIT_COMPILE_FLAGS}"
     )
 
 # TODO: with libiwasm.so only
@@ -275,12 +283,16 @@ function spec_test()
 
     # update basic test cases
     echo "update spec test cases"
-    git fetch origin master
+    git fetch origin main
     # restore from XX_ignore_cases.patch
     # resotre branch
-    git checkout -B master
-    git reset --hard 397399a70565609bf142d211891724e21bffd01f
+    git checkout -B main
+    # [spec] Update note on module initialization trapping (#1493)
+    git reset --hard 044d0d2e77bdcbe891f7e0b9dd2ac01d56435f0b
     git apply ../../spec-test-script/ignore_cases.patch
+    if [[ ${ENABLE_SIMD} == 1 ]]; then
+        git apply ../../spec-test-script/simd_ignore_cases.patch
+    fi
 
     # udpate thread cases
     if [ ${ENABLE_MULTI_THREAD} == 1 ]; then
@@ -291,25 +303,11 @@ function spec_test()
 
         # fetch spec for threads proposal
         git fetch threads
-        # [interpreter] Threading (#179) Fri Aug 6 18:02:59 2021 +0200
-        git reset --hard 0d115b494d640eb0c1c352941fd14ca0bad926d3
+        # Fix error in Web embedding desc for atomic.notify (#185)
+        git reset --hard 85b562cd6805947876ec5e8b975ab0127c55a0a2
         git checkout threads/main
 
         git apply ../../spec-test-script/thread_proposal_ignore_cases.patch
-    fi
-
-    # udpate SIMD cases
-    if [[ ${ENABLE_SIMD} == 1 ]]; then
-        echo "checkout spec for SIMD proposal"
-        # check spec test cases for simd
-        if [[ -z $(git remote | grep "\<simd\>") ]]; then
-            git remote add simd https://github.com/WebAssembly/simd.git
-        fi
-
-        git fetch simd
-        git checkout simd/main -- test/core/simd
-
-        git apply ../../spec-test-script/simd_ignore_cases.patch
     fi
 
     popd
@@ -331,16 +329,16 @@ function spec_test()
                     exit 1
                     ;;
             esac
-            if [ ! -f /tmp/wabt-1.0.24-${WABT_PLATFORM}.tar.gz ]; then
+            if [ ! -f /tmp/wabt-1.0.29-${WABT_PLATFORM}.tar.gz ]; then
                 wget \
-                    https://github.com/WebAssembly/wabt/releases/download/1.0.24/wabt-1.0.24-${WABT_PLATFORM}.tar.gz \
+                    https://github.com/WebAssembly/wabt/releases/download/1.0.29/wabt-1.0.29-${WABT_PLATFORM}.tar.gz \
                     -P /tmp
             fi
 
             cd /tmp \
-            && tar zxf wabt-1.0.24-${WABT_PLATFORM}.tar.gz \
+            && tar zxf wabt-1.0.29-${WABT_PLATFORM}.tar.gz \
             && mkdir -p ${WORK_DIR}/wabt/out/gcc/Release/ \
-            && install wabt-1.0.24/bin/wa* ${WORK_DIR}/wabt/out/gcc/Release/ \
+            && install wabt-1.0.29/bin/wa* ${WORK_DIR}/wabt/out/gcc/Release/ \
             && cd -
         fi
     else
@@ -619,6 +617,16 @@ function trigger()
                 collect_coverage aot
             ;;
 
+            "fast-jit")
+                echo "work in fast-jit mode"
+                # jit
+                BUILD_FLAGS="$FAST_JIT_COMPILE_FLAGS $EXTRA_COMPILE_FLAGS"
+                build_iwasm_with_cfg $BUILD_FLAGS
+                for suite in "${TEST_CASE_ARR[@]}"; do
+                    $suite"_test" fast-jit
+                done
+            ;;
+
             *)
             echo "unexpected mode, do nothing"
             ;;
@@ -637,6 +645,6 @@ else
 fi
 
 echo -e "\033[32mTest finish. Reports are under ${REPORT_DIR} \033[0m"
-DEBUG set +xEevuo pipefail
+DEBUG set +xv pipefail
 echo "TEST SUCCESSFUL"
 exit 0

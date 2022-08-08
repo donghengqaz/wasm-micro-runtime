@@ -45,14 +45,18 @@ set_error_buf_v(char *error_buf, uint32 error_buf_size, const char *format, ...)
 }
 
 WASMModule *
-wasm_load(const uint8 *buf, uint32 size, char *error_buf, uint32 error_buf_size)
+wasm_load(uint8 *buf, uint32 size, char *error_buf, uint32 error_buf_size)
 {
-    return wasm_loader_load(buf, size, error_buf, error_buf_size);
+    return wasm_loader_load(buf, size,
+#if WASM_ENABLE_MULTI_MODULE != 0
+                            true,
+#endif
+                            error_buf, error_buf_size);
 }
 
 WASMModule *
 wasm_load_from_sections(WASMSection *section_list, char *error_buf,
-                        uint32_t error_buf_size)
+                        uint32 error_buf_size)
 {
     return wasm_loader_load_from_sections(section_list, error_buf,
                                           error_buf_size);
@@ -105,7 +109,7 @@ memories_deinstantiate(WASMModuleInstance *module_inst,
         for (i = 0; i < count; i++) {
             if (memories[i]) {
 #if WASM_ENABLE_MULTI_MODULE != 0
-                if (memories[i]->owner != module_inst)
+                if (i < module_inst->module->import_memory_count)
                     continue;
 #endif
 #if WASM_ENABLE_SHARED_MEMORY != 0
@@ -126,8 +130,19 @@ memories_deinstantiate(WASMModuleInstance *module_inst,
                     wasm_runtime_free(memories[i]->heap_handle);
                     memories[i]->heap_handle = NULL;
                 }
-                if (memories[i]->memory_data)
+                if (memories[i]->memory_data) {
+#ifndef OS_ENABLE_HW_BOUND_CHECK
                     wasm_runtime_free(memories[i]->memory_data);
+#else
+#ifdef BH_PLATFORM_WINDOWS
+                    os_mem_decommit(memories[i]->memory_data,
+                                    memories[i]->num_bytes_per_page
+                                        * memories[i]->cur_page_count);
+#endif
+                    os_munmap((uint8 *)memories[i]->memory_data,
+                              8 * (uint64)BH_GB);
+#endif
+                }
                 wasm_runtime_free(memories[i]);
             }
         }
@@ -149,6 +164,11 @@ memory_instantiate(WASMModuleInstance *module_inst, uint32 num_bytes_per_page,
     uint32 inc_page_count, aux_heap_base, global_idx;
     uint32 bytes_of_last_page, bytes_to_page_end;
     uint8 *global_addr;
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    uint8 *mapped_mem;
+    uint64 map_size = 8 * (uint64)BH_GB;
+    uint64 page_size = os_getpagesize();
+#endif
 
 #if WASM_ENABLE_SHARED_MEMORY != 0
     bool is_shared_memory = flags & 0x02 ? true : false;
@@ -218,6 +238,8 @@ memory_instantiate(WASMModuleInstance *module_inst, uint32 num_bytes_per_page,
 
             /* Adjust __heap_base global value */
             global_idx = module->aux_heap_base_global_index;
+            bh_assert(module_inst->globals
+                      && global_idx < module_inst->global_count);
             global_addr = module_inst->global_data
                           + module_inst->globals[global_idx].data_offset;
             *(uint32 *)global_addr = aux_heap_base;
@@ -262,11 +284,45 @@ memory_instantiate(WASMModuleInstance *module_inst, uint32 num_bytes_per_page,
         return NULL;
     }
 
+#ifndef OS_ENABLE_HW_BOUND_CHECK
     if (memory_data_size > 0
         && !(memory->memory_data =
                  runtime_malloc(memory_data_size, error_buf, error_buf_size))) {
         goto fail1;
     }
+#else
+    memory_data_size = (memory_data_size + page_size - 1) & ~(page_size - 1);
+
+    /* Totally 8G is mapped, the opcode load/store address range is 0 to 8G:
+     *   ea = i + memarg.offset
+     * both i and memarg.offset are u32 in range 0 to 4G
+     * so the range of ea is 0 to 8G
+     */
+    if (memory_data_size >= UINT32_MAX
+        || !(memory->memory_data = mapped_mem =
+                 os_mmap(NULL, map_size, MMAP_PROT_NONE, MMAP_MAP_NONE))) {
+        set_error_buf(error_buf, error_buf_size, "mmap memory failed");
+        goto fail1;
+    }
+
+#ifdef BH_PLATFORM_WINDOWS
+    if (!os_mem_commit(mapped_mem, memory_data_size,
+                       MMAP_PROT_READ | MMAP_PROT_WRITE)) {
+        set_error_buf(error_buf, error_buf_size, "commit memory failed");
+        os_munmap(mapped_mem, map_size);
+        goto fail1;
+    }
+#endif
+
+    if (os_mprotect(mapped_mem, memory_data_size,
+                    MMAP_PROT_READ | MMAP_PROT_WRITE)
+        != 0) {
+        set_error_buf(error_buf, error_buf_size, "mprotect memory failed");
+        goto fail2;
+    }
+    /* Newly allocated pages are filled with zero by the OS, we don't fill it
+     * again here */
+#endif /* end of OS_ENABLE_HW_BOUND_CHECK */
 
     memory->module_type = Wasm_Module_Bytecode;
     memory->num_bytes_per_page = num_bytes_per_page;
@@ -292,6 +348,24 @@ memory_instantiate(WASMModuleInstance *module_inst, uint32 num_bytes_per_page,
             goto fail3;
         }
     }
+
+#if WASM_ENABLE_FAST_JIT != 0
+    if (memory_data_size > 0) {
+#if UINTPTR_MAX == UINT64_MAX
+        memory->mem_bound_check_1byte = memory_data_size - 1;
+        memory->mem_bound_check_2bytes = memory_data_size - 2;
+        memory->mem_bound_check_4bytes = memory_data_size - 4;
+        memory->mem_bound_check_8bytes = memory_data_size - 8;
+        memory->mem_bound_check_16bytes = memory_data_size - 16;
+#else
+        memory->mem_bound_check_1byte = (uint32)memory_data_size - 1;
+        memory->mem_bound_check_2bytes = (uint32)memory_data_size - 2;
+        memory->mem_bound_check_4bytes = (uint32)memory_data_size - 4;
+        memory->mem_bound_check_8bytes = (uint32)memory_data_size - 8;
+        memory->mem_bound_check_16bytes = (uint32)memory_data_size - 16;
+#endif
+    }
+#endif
 
 #if WASM_ENABLE_SHARED_MEMORY != 0
     if (0 != os_mutex_init(&memory->mem_lock)) {
@@ -321,8 +395,15 @@ fail3:
     if (heap_size > 0)
         wasm_runtime_free(memory->heap_handle);
 fail2:
+#ifndef OS_ENABLE_HW_BOUND_CHECK
     if (memory->memory_data)
         wasm_runtime_free(memory->memory_data);
+#else
+#ifdef BH_PLATFORM_WINDOWS
+    os_mem_decommit(mapped_mem, memory_data_size);
+#endif
+    os_munmap(mapped_mem, map_size);
+#endif
 fail1:
     wasm_runtime_free(memory);
     return NULL;
@@ -384,13 +465,6 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                 memories_deinstantiate(module_inst, memories, memory_count);
                 return NULL;
             }
-#if WASM_ENABLE_MULTI_MODULE != 0
-            /* The module of the import memory is a builtin module, and
-               the memory is created by current module, set its owner
-               to current module, so the memory can be destroyed in
-               memories_deinstantiate. */
-            memory->owner = module_inst;
-#endif
         }
     }
 
@@ -401,22 +475,6 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
                   module->memories[i].init_page_count,
                   module->memories[i].max_page_count, heap_size,
                   module->memories[i].flags, error_buf, error_buf_size))) {
-            memories_deinstantiate(module_inst, memories, memory_count);
-            return NULL;
-        }
-#if WASM_ENABLE_MULTI_MODULE != 0
-        memory->owner = module_inst;
-#endif
-    }
-
-    if (mem_index == 0) {
-        /**
-         * no import memory and define memory, but still need heap
-         * for wasm code
-         */
-        if (!(memory = memories[mem_index++] =
-                  memory_instantiate(module_inst, 0, 0, 0, heap_size, 0,
-                                     error_buf, error_buf_size))) {
             memories_deinstantiate(module_inst, memories, memory_count);
             return NULL;
         }
@@ -586,6 +644,14 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         return NULL;
     }
 
+    total_size = sizeof(void *) * (uint64)module->import_function_count;
+    if (total_size > 0
+        && !(module_inst->import_func_ptrs =
+                 runtime_malloc(total_size, error_buf, error_buf_size))) {
+        wasm_runtime_free(functions);
+        return NULL;
+    }
+
     /* instantiate functions from import section */
     function = functions;
     import = module->import_functions;
@@ -614,6 +680,10 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
         function->local_count = 0;
         function->local_types = NULL;
 
+        /* Copy the function pointer to current instance */
+        module_inst->import_func_ptrs[i] =
+            function->u.func_import->func_ptr_linked;
+
         function++;
     }
 
@@ -640,6 +710,10 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
 
         function++;
     }
+
+#if WASM_ENABLE_FAST_JIT != 0
+    module_inst->fast_jit_func_ptrs = module->fast_jit_func_ptrs;
+#endif
 
     bh_assert((uint32)(function - functions) == function_count);
     (void)module_inst;
@@ -954,6 +1028,9 @@ execute_malloc_function(WASMModuleInstance *module_inst,
                         WASMFunctionInstance *retain_func, uint32 size,
                         uint32 *p_result)
 {
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    WASMExecEnv *exec_env_tls = wasm_runtime_get_exec_env_tls();
+#endif
     uint32 argv[2], argc;
     bool ret;
 
@@ -972,12 +1049,26 @@ execute_malloc_function(WASMModuleInstance *module_inst,
         argc = 2;
     }
 
-    ret = wasm_create_exec_env_and_call_function(module_inst, malloc_func, argc,
-                                                 argv, false);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    if (exec_env_tls != NULL) {
+        bh_assert(exec_env_tls->module_inst
+                  == (WASMModuleInstanceCommon *)module_inst);
+        ret = wasm_call_function(exec_env_tls, malloc_func, argc, argv);
 
-    if (retain_func && ret) {
-        ret = wasm_create_exec_env_and_call_function(module_inst, retain_func,
-                                                     1, argv, false);
+        if (retain_func && ret) {
+            ret = wasm_call_function(exec_env_tls, retain_func, 1, argv);
+        }
+    }
+    else
+#endif
+    {
+        ret = wasm_create_exec_env_and_call_function(module_inst, malloc_func,
+                                                     argc, argv, false);
+
+        if (retain_func && ret) {
+            ret = wasm_create_exec_env_and_call_function(
+                module_inst, retain_func, 1, argv, false);
+        }
     }
 
     if (ret)
@@ -989,11 +1080,24 @@ static bool
 execute_free_function(WASMModuleInstance *module_inst,
                       WASMFunctionInstance *free_func, uint32 offset)
 {
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    WASMExecEnv *exec_env_tls = wasm_runtime_get_exec_env_tls();
+#endif
     uint32 argv[2];
 
     argv[0] = offset;
-    return wasm_create_exec_env_and_call_function(module_inst, free_func, 1,
-                                                  argv, false);
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+    if (exec_env_tls != NULL) {
+        bh_assert(exec_env_tls->module_inst
+                  == (WASMModuleInstanceCommon *)module_inst);
+        return wasm_call_function(exec_env_tls, free_func, 1, argv);
+    }
+    else
+#endif
+    {
+        return wasm_create_exec_env_and_call_function(module_inst, free_func, 1,
+                                                      argv, false);
+    }
 }
 
 #if WASM_ENABLE_MULTI_MODULE != 0
@@ -1007,15 +1111,17 @@ sub_module_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
         bh_list_first_elem(module->import_module_list);
 
     while (sub_module_list_node) {
-        WASMSubModInstNode *sub_module_inst_list_node;
+        WASMSubModInstNode *sub_module_inst_list_node = NULL;
         WASMModule *sub_module = (WASMModule *)sub_module_list_node->module;
-        WASMModuleInstance *sub_module_inst =
+        WASMModuleInstance *sub_module_inst = NULL;
+
+        sub_module_inst =
             wasm_instantiate(sub_module, false, stack_size, heap_size,
                              error_buf, error_buf_size);
         if (!sub_module_inst) {
             LOG_DEBUG("instantiate %s failed",
                       sub_module_list_node->module_name);
-            return false;
+            goto failed;
         }
 
         sub_module_inst_list_node = runtime_malloc(sizeof(WASMSubModInstNode),
@@ -1023,8 +1129,7 @@ sub_module_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
         if (!sub_module_inst_list_node) {
             LOG_DEBUG("Malloc WASMSubModInstNode failed, SZ:%d",
                       sizeof(WASMSubModInstNode));
-            wasm_deinstantiate(sub_module_inst, false);
-            return false;
+            goto failed;
         }
 
         sub_module_inst_list_node->module_inst = sub_module_inst;
@@ -1036,6 +1141,39 @@ sub_module_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
         (void)ret;
 
         sub_module_list_node = bh_list_elem_next(sub_module_list_node);
+
+#if WASM_ENABLE_LIBC_WASI != 0
+        {
+            /*
+             * reactor instances may assume that _initialize will be called by
+             * the environment at most once, and that none of their other
+             * exports are accessed before that call.
+             *
+             * let the loader decide how to act if there is no _initialize
+             * in a reactor
+             */
+            WASMFunctionInstance *initialize =
+                wasm_lookup_function(sub_module_inst, "_initialize", NULL);
+            if (initialize
+                && !wasm_create_exec_env_and_call_function(
+                    sub_module_inst, initialize, 0, NULL, false)) {
+                set_error_buf(error_buf, error_buf_size,
+                              "Call _initialize failed ");
+                goto failed;
+            }
+        }
+#endif
+
+        continue;
+    failed:
+        if (sub_module_inst_list_node) {
+            bh_list_remove(sub_module_inst_list, sub_module_inst_list_node);
+            wasm_runtime_free(sub_module_inst_list_node);
+        }
+
+        if (sub_module_inst)
+            wasm_deinstantiate(sub_module_inst, false);
+        return false;
     }
 
     return true;
@@ -1071,18 +1209,12 @@ check_linked_symbol(WASMModuleInstance *module_inst, char *error_buf,
             && !func->import_func_linked
 #endif
         ) {
-#if WASM_ENABLE_SPEC_TEST != 0
-            set_error_buf(error_buf, error_buf_size,
-                          "unknown import or incompatible import type");
-            return false;
-#else
 #if WASM_ENABLE_WAMR_COMPILER == 0
             LOG_WARNING("warning: failed to link import function (%s, %s)",
                         func->module_name, func->field_name);
 #else
             /* do nothing to avoid confused message */
 #endif /* WASM_ENABLE_WAMR_COMPILER == 0 */
-#endif /* WASM_ENABLE_SPEC_TEST != 0 */
         }
     }
 
@@ -1311,12 +1443,14 @@ wasm_instantiate(WASMModule *module, bool is_sub_inst, uint32 stack_size,
                 goto fail;
             }
 
-            data_seg->base_offset.u.i32 =
+            base_offset =
                 globals[data_seg->base_offset.u.global_index].initial_value.i32;
+        }
+        else {
+            base_offset = (uint32)data_seg->base_offset.u.i32;
         }
 
         /* check offset */
-        base_offset = (uint32)data_seg->base_offset.u.i32;
         if (base_offset > memory_size) {
             LOG_DEBUG("base_offset(%d) > memory_size(%d)", base_offset,
                       memory_size);
@@ -1466,8 +1600,8 @@ wasm_instantiate(WASMModule *module, bool is_sub_inst, uint32 stack_size,
     if (stack_size == 0)
         stack_size = DEFAULT_WASM_STACK_SIZE;
 #if WASM_ENABLE_SPEC_TEST != 0
-    if (stack_size < 48 * 1024)
-        stack_size = 48 * 1024;
+    if (stack_size < 128 * 1024)
+        stack_size = 128 * 1024;
 #endif
     module_inst->default_wasm_stack_size = stack_size;
 
@@ -1494,6 +1628,7 @@ wasm_instantiate(WASMModule *module, bool is_sub_inst, uint32 stack_size,
                 module->wasi_args.dir_list, module->wasi_args.dir_count,
                 module->wasi_args.map_dir_list, module->wasi_args.map_dir_count,
                 module->wasi_args.env, module->wasi_args.env_count,
+                module->wasi_args.addr_pool, module->wasi_args.addr_count,
                 module->wasi_args.argv, module->wasi_args.argc,
                 module->wasi_args.stdio[0], module->wasi_args.stdio[1],
                 module->wasi_args.stdio[2], error_buf, error_buf_size)) {
@@ -1518,7 +1653,7 @@ wasm_instantiate(WASMModule *module, bool is_sub_inst, uint32 stack_size,
 
 #if WASM_ENABLE_BULK_MEMORY != 0
 #if WASM_ENABLE_LIBC_WASI != 0
-    if (!module->is_wasi_module) {
+    if (!module->import_wasi_api) {
 #endif
         /* Only execute the memory init function for main instance because
             the data segments will be dropped once initialized.
@@ -1571,6 +1706,10 @@ wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
     if (module_inst->memory_count > 0)
         memories_deinstantiate(module_inst, module_inst->memories,
                                module_inst->memory_count);
+
+    if (module_inst->import_func_ptrs) {
+        wasm_runtime_free(module_inst->import_func_ptrs);
+    }
 
     tables_deinstantiate(module_inst->tables, module_inst->table_count);
     functions_deinstantiate(module_inst->functions,
@@ -1674,6 +1813,204 @@ clear_wasi_proc_exit_exception(WASMModuleInstance *module_inst)
 #endif
 }
 
+#ifdef OS_ENABLE_HW_BOUND_CHECK
+
+#ifndef BH_PLATFORM_WINDOWS
+void
+wasm_signal_handler(WASMSignalInfo *sig_info)
+{
+    WASMExecEnv *exec_env_tls = sig_info->exec_env_tls;
+    void *sig_addr = sig_info->sig_addr;
+    WASMModuleInstance *module_inst;
+    WASMMemoryInstance *memory_inst;
+    WASMJmpBuf *jmpbuf_node;
+    uint8 *mapped_mem_start_addr = NULL;
+    uint8 *mapped_mem_end_addr = NULL;
+    uint8 *stack_min_addr;
+    uint32 page_size;
+    uint32 guard_page_count = STACK_OVERFLOW_CHECK_GUARD_PAGE_COUNT;
+
+    /* Check whether current thread is running wasm function */
+    if (exec_env_tls && exec_env_tls->handle == os_self_thread()
+        && (jmpbuf_node = exec_env_tls->jmpbuf_stack_top)) {
+        /* Get mapped mem info of current instance */
+        module_inst = (WASMModuleInstance *)exec_env_tls->module_inst;
+        /* Get the default memory instance */
+        memory_inst = module_inst->default_memory;
+        if (memory_inst) {
+            mapped_mem_start_addr = (uint8 *)memory_inst->memory_data;
+            mapped_mem_end_addr =
+                (uint8 *)memory_inst->memory_data + 8 * (uint64)BH_GB;
+        }
+
+        /* Get stack info of current thread */
+        page_size = os_getpagesize();
+        stack_min_addr = os_thread_get_stack_boundary();
+
+        if (memory_inst
+            && (mapped_mem_start_addr <= (uint8 *)sig_addr
+                && (uint8 *)sig_addr < mapped_mem_end_addr)) {
+            /* The address which causes segmentation fault is inside
+               the memory instance's guard regions */
+            wasm_set_exception(module_inst, "out of bounds memory access");
+            os_longjmp(jmpbuf_node->jmpbuf, 1);
+        }
+        else if (stack_min_addr - page_size <= (uint8 *)sig_addr
+                 && (uint8 *)sig_addr
+                        < stack_min_addr + page_size * guard_page_count) {
+            /* The address which causes segmentation fault is inside
+               native thread's guard page */
+            wasm_set_exception(module_inst, "native stack overflow");
+            os_longjmp(jmpbuf_node->jmpbuf, 1);
+        }
+    }
+}
+#else  /* else of BH_PLATFORM_WINDOWS */
+LONG
+wasm_exception_handler(WASMSignalInfo *sig_info)
+{
+    WASMExecEnv *exec_env_tls = sig_info->exec_env_tls;
+    EXCEPTION_POINTERS *exce_info = sig_info->exce_info;
+    PEXCEPTION_RECORD ExceptionRecord = exce_info->ExceptionRecord;
+    uint8 *sig_addr = (uint8 *)ExceptionRecord->ExceptionInformation[1];
+    WASMModuleInstance *module_inst;
+    WASMMemoryInstance *memory_inst;
+    WASMJmpBuf *jmpbuf_node;
+    uint8 *mapped_mem_start_addr = NULL;
+    uint8 *mapped_mem_end_addr = NULL;
+    uint32 page_size = os_getpagesize();
+
+    if (exec_env_tls && exec_env_tls->handle == os_self_thread()
+        && (jmpbuf_node = exec_env_tls->jmpbuf_stack_top)) {
+        module_inst = (WASMModuleInstance *)exec_env_tls->module_inst;
+        if (ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+            /* Get the default memory instance */
+            memory_inst = module_inst->default_memory;
+            if (memory_inst) {
+                mapped_mem_start_addr = (uint8 *)memory_inst->memory_data;
+                mapped_mem_end_addr =
+                    (uint8 *)memory_inst->memory_data + 8 * (uint64)BH_GB;
+                if (mapped_mem_start_addr <= (uint8 *)sig_addr
+                    && (uint8 *)sig_addr < mapped_mem_end_addr) {
+                    /* The address which causes segmentation fault is inside
+                       the memory instance's guard regions.
+                       Set exception and let the wasm func continue to run, when
+                       the wasm func returns, the caller will check whether the
+                       exception is thrown and return to runtime. */
+                    wasm_set_exception(module_inst,
+                                       "out of bounds memory access");
+                    /* Skip current instruction */
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+            }
+        }
+        else if (ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+            /* Set stack overflow exception and let the wasm func continue
+               to run, when the wasm func returns, the caller will check
+               whether the exception is thrown and return to runtime, and
+               the damaged stack will be recovered by _resetstkoflw(). */
+            wasm_set_exception(module_inst, "native stack overflow");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
+    os_printf("Unhandled exception thrown:  exception code: 0x%lx, "
+              "exception address: %p, exception information: %p\n",
+              ExceptionRecord->ExceptionCode, ExceptionRecord->ExceptionAddress,
+              sig_addr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif /* end of BH_PLATFORM_WINDOWS */
+
+static void
+call_wasm_with_hw_bound_check(WASMModuleInstance *module_inst,
+                              WASMExecEnv *exec_env,
+                              WASMFunctionInstance *function, unsigned argc,
+                              uint32 argv[])
+{
+    WASMExecEnv *exec_env_tls = wasm_runtime_get_exec_env_tls();
+    WASMJmpBuf jmpbuf_node = { 0 }, *jmpbuf_node_pop;
+    uint32 page_size = os_getpagesize();
+    uint32 guard_page_count = STACK_OVERFLOW_CHECK_GUARD_PAGE_COUNT;
+#ifdef BH_PLATFORM_WINDOWS
+    const char *exce;
+    int result;
+#endif
+    bool ret = true;
+
+    /* Check native stack overflow firstly to ensure we have enough
+       native stack to run the following codes before actually calling
+       the aot function in invokeNative function. */
+    if ((uint8 *)&exec_env_tls < exec_env->native_stack_boundary
+                                     + page_size * (guard_page_count + 1)) {
+        wasm_set_exception(module_inst, "native stack overflow");
+        return;
+    }
+
+    if (exec_env_tls && (exec_env_tls != exec_env)) {
+        wasm_set_exception(module_inst, "invalid exec env");
+        return;
+    }
+
+    if (!os_thread_signal_inited()) {
+        wasm_set_exception(module_inst, "thread signal env not inited");
+        return;
+    }
+
+    wasm_exec_env_push_jmpbuf(exec_env, &jmpbuf_node);
+
+    wasm_runtime_set_exec_env_tls(exec_env);
+    if (os_setjmp(jmpbuf_node.jmpbuf) == 0) {
+#ifndef BH_PLATFORM_WINDOWS
+        wasm_interp_call_wasm(module_inst, exec_env, function, argc, argv);
+#else
+        __try {
+            wasm_interp_call_wasm(module_inst, exec_env, function, argc, argv);
+        } __except (wasm_get_exception(module_inst)
+                        ? EXCEPTION_EXECUTE_HANDLER
+                        : EXCEPTION_CONTINUE_SEARCH) {
+            /* exception was thrown in wasm_exception_handler */
+            ret = false;
+        }
+        if ((exce = wasm_get_exception(module_inst))
+            && strstr(exce, "native stack overflow")) {
+            /* After a stack overflow, the stack was left
+               in a damaged state, let the CRT repair it */
+            result = _resetstkoflw();
+            bh_assert(result != 0);
+        }
+#endif
+    }
+    else {
+        /* Exception has been set in signal handler before calling longjmp */
+        ret = false;
+    }
+
+    if (wasm_get_exception(module_inst)) {
+#if WASM_ENABLE_DUMP_CALL_STACK != 0
+        if (wasm_interp_create_call_stack(exec_env)) {
+            wasm_interp_dump_call_stack(exec_env, true, NULL, 0);
+        }
+#endif
+        wasm_interp_restore_wasm_frame(exec_env);
+    }
+
+    jmpbuf_node_pop = wasm_exec_env_pop_jmpbuf(exec_env);
+    bh_assert(&jmpbuf_node == jmpbuf_node_pop);
+    if (!exec_env->jmpbuf_stack_top) {
+        wasm_runtime_set_exec_env_tls(NULL);
+    }
+    if (!ret) {
+        os_sigreturn();
+        os_signal_unmask();
+    }
+    (void)jmpbuf_node_pop;
+}
+#define interp_call_wasm call_wasm_with_hw_bound_check
+#else
+#define interp_call_wasm wasm_interp_call_wasm
+#endif
+
 bool
 wasm_call_function(WASMExecEnv *exec_env, WASMFunctionInstance *function,
                    unsigned argc, uint32 argv[])
@@ -1684,7 +2021,7 @@ wasm_call_function(WASMExecEnv *exec_env, WASMFunctionInstance *function,
     /* set thread handle and stack boundary */
     wasm_exec_env_set_thread_info(exec_env);
 
-    wasm_interp_call_wasm(module_inst, exec_env, function, argc, argv);
+    interp_call_wasm(module_inst, exec_env, function, argc, argv);
     (void)clear_wasi_proc_exit_exception(module_inst);
     return !wasm_get_exception(module_inst) ? true : false;
 }
@@ -1695,15 +2032,17 @@ wasm_create_exec_env_and_call_function(WASMModuleInstance *module_inst,
                                        unsigned argc, uint32 argv[],
                                        bool enable_debug)
 {
-    WASMExecEnv *exec_env;
+    WASMExecEnv *exec_env, *existing_exec_env = NULL;
     bool ret;
 
-#if WASM_ENABLE_THREAD_MGR != 0
-    WASMExecEnv *existing_exec_env = NULL;
-
-    if (!(existing_exec_env = exec_env = wasm_clusters_search_exec_env(
-              (WASMModuleInstanceCommon *)module_inst))) {
+#if defined(OS_ENABLE_HW_BOUND_CHECK)
+    existing_exec_env = exec_env = wasm_runtime_get_exec_env_tls();
+#elif WASM_ENABLE_THREAD_MGR != 0
+    existing_exec_env = exec_env =
+        wasm_clusters_search_exec_env((WASMModuleInstanceCommon *)module_inst);
 #endif
+
+    if (!existing_exec_env) {
         if (!(exec_env =
                   wasm_exec_env_create((WASMModuleInstanceCommon *)module_inst,
                                        module_inst->default_wasm_stack_size))) {
@@ -1712,28 +2051,18 @@ wasm_create_exec_env_and_call_function(WASMModuleInstance *module_inst,
         }
 
 #if WASM_ENABLE_THREAD_MGR != 0
-        if (enable_debug) {
 #if WASM_ENABLE_DEBUG_INTERP != 0
+        if (enable_debug) {
             wasm_runtime_start_debug_instance(exec_env);
-#endif
         }
+#endif
+#endif
     }
-#endif
-
-#if WASM_ENABLE_REF_TYPES != 0
-    wasm_runtime_prepare_call_function(exec_env, func);
-#endif
 
     ret = wasm_call_function(exec_env, func, argc, argv);
 
-#if WASM_ENABLE_REF_TYPES != 0
-    wasm_runtime_finalize_call_function(exec_env, func, ret, argv);
-#endif
-
-#if WASM_ENABLE_THREAD_MGR != 0
-    /* don't destroy the exec_env if it's searched from the cluster */
+    /* don't destroy the exec_env if it isn't created in this function */
     if (!existing_exec_env)
-#endif
         wasm_exec_env_destroy(exec_env);
 
     return ret;
@@ -1742,9 +2071,14 @@ wasm_create_exec_env_and_call_function(WASMModuleInstance *module_inst,
 bool
 wasm_create_exec_env_singleton(WASMModuleInstance *module_inst)
 {
-    WASMExecEnv *exec_env =
-        wasm_exec_env_create((WASMModuleInstanceCommon *)module_inst,
-                             module_inst->default_wasm_stack_size);
+    WASMExecEnv *exec_env = NULL;
+
+    if (module_inst->exec_env_singleton) {
+        return true;
+    }
+
+    exec_env = wasm_exec_env_create((WASMModuleInstanceCommon *)module_inst,
+                                    module_inst->default_wasm_stack_size);
     if (exec_env)
         module_inst->exec_env_singleton = exec_env;
 
@@ -1890,8 +2224,8 @@ wasm_module_realloc(WASMModuleInstance *module_inst, uint32 ptr, uint32 size,
     }
 
     if (memory->heap_handle) {
-        addr = mem_allocator_realloc(memory->heap_handle,
-                                     memory->memory_data + ptr, size);
+        addr = mem_allocator_realloc(
+            memory->heap_handle, ptr ? memory->memory_data + ptr : NULL, size);
     }
 
     /* Only support realloc in WAMR's app heap */
@@ -2084,6 +2418,7 @@ wasm_get_native_addr_range(WASMModuleInstance *module_inst, uint8 *native_ptr,
     return false;
 }
 
+#ifndef OS_ENABLE_HW_BOUND_CHECK
 bool
 wasm_enlarge_memory(WASMModuleInstance *module, uint32 inc_page_count)
 {
@@ -2166,8 +2501,75 @@ wasm_enlarge_memory(WASMModuleInstance *module, uint32 inc_page_count)
     memory->memory_data_end =
         memory->memory_data + memory->num_bytes_per_page * total_page_count;
 
+#if WASM_ENABLE_FAST_JIT != 0
+#if UINTPTR_MAX == UINT64_MAX
+    memory->mem_bound_check_1byte = total_size - 1;
+    memory->mem_bound_check_2bytes = total_size - 2;
+    memory->mem_bound_check_4bytes = total_size - 4;
+    memory->mem_bound_check_8bytes = total_size - 8;
+    memory->mem_bound_check_16bytes = total_size - 16;
+#else
+    memory->mem_bound_check_1byte = (uint32)total_size - 1;
+    memory->mem_bound_check_2bytes = (uint32)total_size - 2;
+    memory->mem_bound_check_4bytes = (uint32)total_size - 4;
+    memory->mem_bound_check_8bytes = (uint32)total_size - 8;
+    memory->mem_bound_check_16bytes = (uint32)total_size - 16;
+#endif
+#endif
+
     return ret;
 }
+#else
+bool
+wasm_enlarge_memory(WASMModuleInstance *module, uint32 inc_page_count)
+{
+    WASMMemoryInstance *memory = module->default_memory;
+    uint32 num_bytes_per_page, total_page_count;
+
+    if (!memory)
+        return false;
+
+    total_page_count = inc_page_count + memory->cur_page_count;
+
+    if (inc_page_count <= 0)
+        /* No need to enlarge memory */
+        return true;
+
+    if (total_page_count < memory->cur_page_count /* integer overflow */
+        || total_page_count > memory->max_page_count) {
+        return false;
+    }
+
+    num_bytes_per_page = memory->num_bytes_per_page;
+
+#ifdef BH_PLATFORM_WINDOWS
+    if (!os_mem_commit(memory->memory_data_end,
+                       num_bytes_per_page * inc_page_count,
+                       MMAP_PROT_READ | MMAP_PROT_WRITE)) {
+        return false;
+    }
+#endif
+
+    if (os_mprotect(memory->memory_data_end,
+                    num_bytes_per_page * inc_page_count,
+                    MMAP_PROT_READ | MMAP_PROT_WRITE)
+        != 0) {
+#ifdef BH_PLATFORM_WINDOWS
+        os_mem_decommit(memory->memory_data_end,
+                        num_bytes_per_page * inc_page_count);
+#endif
+        return false;
+    }
+
+    /* The increased pages are filled with zero by the OS when os_mmap,
+       no need to memset it again here */
+
+    memory->cur_page_count = total_page_count;
+    memory->memory_data_end =
+        memory->memory_data + num_bytes_per_page * total_page_count;
+    return true;
+}
+#endif /* end of OS_ENABLE_HW_BOUND_CHECK */
 
 #if WASM_ENABLE_REF_TYPES != 0
 bool
@@ -2209,14 +2611,14 @@ wasm_enlarge_table(WASMModuleInstance *module_inst, uint32 table_idx,
 }
 #endif /* WASM_ENABLE_REF_TYPES != 0 */
 
-bool
-wasm_call_indirect(WASMExecEnv *exec_env, uint32_t tbl_idx,
-                   uint32_t element_indices, uint32_t argc, uint32_t argv[])
+static bool
+call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 elem_idx,
+              uint32 argc, uint32 argv[], bool check_type_idx, uint32 type_idx)
 {
     WASMModuleInstance *module_inst = NULL;
     WASMTableInstance *table_inst = NULL;
-    uint32_t function_indices = 0;
-    WASMFunctionInstance *function_inst = NULL;
+    uint32 func_idx = 0;
+    WASMFunctionInstance *func_inst = NULL;
 
     module_inst = (WASMModuleInstance *)exec_env->module_inst;
     bh_assert(module_inst);
@@ -2227,7 +2629,7 @@ wasm_call_indirect(WASMExecEnv *exec_env, uint32_t tbl_idx,
         goto got_exception;
     }
 
-    if (element_indices >= table_inst->cur_size) {
+    if (elem_idx >= table_inst->cur_size) {
         wasm_set_exception(module_inst, "undefined element");
         goto got_exception;
     }
@@ -2236,8 +2638,8 @@ wasm_call_indirect(WASMExecEnv *exec_env, uint32_t tbl_idx,
      * please be aware that table_inst->base_addr may point
      * to another module's table
      **/
-    function_indices = ((uint32_t *)table_inst->base_addr)[element_indices];
-    if (function_indices == NULL_REF) {
+    func_idx = ((uint32 *)table_inst->base_addr)[elem_idx];
+    if (func_idx == NULL_REF) {
         wasm_set_exception(module_inst, "uninitialized element");
         goto got_exception;
     }
@@ -2245,14 +2647,29 @@ wasm_call_indirect(WASMExecEnv *exec_env, uint32_t tbl_idx,
     /**
      * we insist to call functions owned by the module itself
      **/
-    if (function_indices >= module_inst->function_count) {
+    if (func_idx >= module_inst->function_count) {
         wasm_set_exception(module_inst, "unknown function");
         goto got_exception;
     }
 
-    function_inst = module_inst->functions + function_indices;
+    func_inst = module_inst->functions + func_idx;
 
-    wasm_interp_call_wasm(module_inst, exec_env, function_inst, argc, argv);
+    if (check_type_idx) {
+        WASMType *cur_type = module_inst->module->types[type_idx];
+        WASMType *cur_func_type;
+
+        if (func_inst->is_import_func)
+            cur_func_type = func_inst->u.func_import->func_type;
+        else
+            cur_func_type = func_inst->u.func->func_type;
+
+        if (!wasm_type_equal(cur_type, cur_func_type)) {
+            wasm_set_exception(module_inst, "indirect call type mismatch");
+            goto got_exception;
+        }
+    }
+
+    interp_call_wasm(module_inst, exec_env, func_inst, argc, argv);
 
     (void)clear_wasi_proc_exit_exception(module_inst);
     return !wasm_get_exception(module_inst) ? true : false;
@@ -2260,6 +2677,23 @@ wasm_call_indirect(WASMExecEnv *exec_env, uint32_t tbl_idx,
 got_exception:
     return false;
 }
+
+bool
+wasm_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 elem_idx,
+                   uint32 argc, uint32 argv[])
+{
+    return call_indirect(exec_env, tbl_idx, elem_idx, argc, argv, false, 0);
+}
+
+#if WASM_ENABLE_FAST_JIT != 0
+bool
+jit_call_indirect(WASMExecEnv *exec_env, uint32 tbl_idx, uint32 elem_idx,
+                  uint32 type_idx, uint32 argc, uint32 argv[])
+{
+    return call_indirect(exec_env, tbl_idx, elem_idx, argc, argv, true,
+                         type_idx);
+}
+#endif
 
 #if WASM_ENABLE_THREAD_MGR != 0
 bool
@@ -2388,9 +2822,6 @@ wasm_get_module_mem_consumption(const WASMModule *module,
     mem_conspn->total_size += mem_conspn->table_segs_size;
     mem_conspn->total_size += mem_conspn->data_segs_size;
     mem_conspn->total_size += mem_conspn->const_strs_size;
-#if WASM_ENABLE_AOT != 0
-    mem_conspn->total_size += mem_conspn->aot_code_size;
-#endif
 }
 
 void
@@ -2458,8 +2889,8 @@ wasm_get_module_inst_mem_consumption(const WASMModuleInstance *module_inst,
                  || (WASM_ENABLE_MEMORY_TRACING != 0) */
 
 #if WASM_ENABLE_DUMP_CALL_STACK != 0
-void
-wasm_interp_dump_call_stack(struct WASMExecEnv *exec_env)
+bool
+wasm_interp_create_call_stack(struct WASMExecEnv *exec_env)
 {
     WASMModuleInstance *module_inst =
         (WASMModuleInstance *)wasm_exec_env_get_module_inst(exec_env);
@@ -2478,13 +2909,14 @@ wasm_interp_dump_call_stack(struct WASMExecEnv *exec_env)
 
     /* release previous stack frames and create new ones */
     if (!bh_vector_destroy(module_inst->frames)
-        || !bh_vector_init(module_inst->frames, n, sizeof(WASMCApiFrame))) {
-        return;
+        || !bh_vector_init(module_inst->frames, n, sizeof(WASMCApiFrame),
+                           false)) {
+        return false;
     }
 
     cur_frame = first_frame;
     n = 0;
-    os_printf("\n");
+
     while (cur_frame) {
         WASMCApiFrame frame = { 0 };
         WASMFunctionInstance *func_inst = cur_frame->function;
@@ -2532,20 +2964,86 @@ wasm_interp_dump_call_stack(struct WASMExecEnv *exec_env)
             }
         }
 
-        /* function name not exported, print number instead */
-        if (func_name == NULL) {
-            os_printf("#%02d $f%d \n", n, func_inst - module_inst->functions);
-        }
-        else {
-            os_printf("#%02d %s \n", n, func_name);
-        }
+        frame.func_name_wp = func_name;
 
-        /* keep print */
-        bh_vector_append(module_inst->frames, &frame);
+        if (!bh_vector_append(module_inst->frames, &frame)) {
+            bh_vector_destroy(module_inst->frames);
+            return false;
+        }
 
         cur_frame = cur_frame->prev_frame;
         n++;
     }
-    os_printf("\n");
+
+    return true;
+}
+
+#define PRINT_OR_DUMP()                                                   \
+    do {                                                                  \
+        total_len +=                                                      \
+            wasm_runtime_dump_line_buf_impl(line_buf, print, &buf, &len); \
+        if ((!print) && buf && (len == 0)) {                              \
+            return total_len;                                             \
+        }                                                                 \
+    } while (0)
+
+uint32
+wasm_interp_dump_call_stack(struct WASMExecEnv *exec_env, bool print, char *buf,
+                            uint32 len)
+{
+    WASMModuleInstance *module_inst =
+        (WASMModuleInstance *)wasm_exec_env_get_module_inst(exec_env);
+    uint32 n = 0, total_len = 0, total_frames;
+    /* reserve 256 bytes for line buffer, any line longer than 256 bytes
+     * will be truncated */
+    char line_buf[256];
+
+    if (!module_inst->frames) {
+        return 0;
+    }
+
+    total_frames = bh_vector_size(module_inst->frames);
+    if (total_frames == 0) {
+        return 0;
+    }
+
+    snprintf(line_buf, sizeof(line_buf), "\n");
+    PRINT_OR_DUMP();
+
+    while (n < total_frames) {
+        WASMCApiFrame frame = { 0 };
+        uint32 line_length, i;
+
+        if (!bh_vector_get(module_inst->frames, n, &frame)) {
+            return 0;
+        }
+
+        /* function name not exported, print number instead */
+        if (frame.func_name_wp == NULL) {
+            line_length = snprintf(line_buf, sizeof(line_buf), "#%02d $f%d\n",
+                                   n, frame.func_index);
+        }
+        else {
+            line_length = snprintf(line_buf, sizeof(line_buf), "#%02d %s\n", n,
+                                   frame.func_name_wp);
+        }
+
+        if (line_length >= sizeof(line_buf)) {
+            uint32 line_buffer_len = sizeof(line_buf);
+            /* If line too long, ensure the last character is '\n' */
+            for (i = line_buffer_len - 5; i < line_buffer_len - 2; i++) {
+                line_buf[i] = '.';
+            }
+            line_buf[line_buffer_len - 2] = '\n';
+        }
+
+        PRINT_OR_DUMP();
+
+        n++;
+    }
+    snprintf(line_buf, sizeof(line_buf), "\n");
+    PRINT_OR_DUMP();
+
+    return total_len + 1;
 }
 #endif /* end of WASM_ENABLE_DUMP_CALL_STACK */
